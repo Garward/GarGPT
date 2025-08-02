@@ -130,4 +130,5 @@ import time
 bot.start_time = time.time()
 
 if __name__ == "__main__":
+    print("Launching bot...")
     bot.run(DISCORD_BOT_TOKEN)
