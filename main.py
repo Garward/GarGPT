@@ -1,181 +1,618 @@
 import discord
 from discord.ext import commands
-import openai import OpenAI
+import openai
+from openai import OpenAI
 import sqlite3
 import os
 import requests
 import asyncio
+import logging
+import time
+import re
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from contextlib import contextmanager
 from discord import app_commands
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('gargpt.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Environment variable validation
+def validate_environment():
+    """Validate that all required environment variables are set."""
+    required_vars = {
+        'OPENAI_API_KEY': 'OpenAI API key for GPT-4o access',
+        'DISCORD_BOT_TOKEN': 'Discord bot token',
+        'BRAVE_API_KEY': 'Brave Search API key for web search'
+    }
+    
+    missing_vars = []
+    for var, description in required_vars.items():
+        if not os.getenv(var):
+            missing_vars.append(f"{var} ({description})")
+    
+    if missing_vars:
+        logger.error("Missing required environment variables:")
+        for var in missing_vars:
+            logger.error(f"  - {var}")
+        raise ValueError("Required environment variables are missing. Please set them before starting the bot.")
+    
+    logger.info("All required environment variables are set.")
+
+# Validate environment on startup
+validate_environment()
+
+# Load configuration from environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+ALLOWED_ROLES = [role.strip() for role in os.getenv("ALLOWED_ROLES", "").split(",") if role.strip()]
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
+MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "2000"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+
+# Input validation and sanitization
+def sanitize_input(text: str, max_length: int = MAX_PROMPT_LENGTH) -> str:
+    """Sanitize and validate user input."""
+    if not isinstance(text, str):
+        raise ValueError("Input must be a string")
+    
+    # Remove potentially harmful characters
+    text = re.sub(r'[^\w\s\-.,!?;:()\[\]{}"\'/\\@#$%^&*+=<>|`~]', '', text)
+    
+    # Limit length
+    if len(text) > max_length:
+        text = text[:max_length]
+        logger.warning(f"Input truncated to {max_length} characters")
+    
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    if not text:
+        raise ValueError("Input cannot be empty after sanitization")
+    
+    return text
+
+# Rate limiting system
+class RateLimiter:
+    def __init__(self):
+        self.user_requests: Dict[int, list] = {}
+    
+    def is_rate_limited(self, user_id: int) -> bool:
+        """Check if user is rate limited."""
+        now = time.time()
+        if user_id not in self.user_requests:
+            self.user_requests[user_id] = []
+        
+        # Clean old requests
+        self.user_requests[user_id] = [
+            req_time for req_time in self.user_requests[user_id]
+            if now - req_time < RATE_LIMIT_WINDOW
+        ]
+        
+        # Check if user has exceeded rate limit
+        if len(self.user_requests[user_id]) >= RATE_LIMIT_REQUESTS:
+            return True
+        
+        # Add current request
+        self.user_requests[user_id].append(now)
+        return False
+    
+    def get_reset_time(self, user_id: int) -> int:
+        """Get seconds until rate limit resets."""
+        if user_id not in self.user_requests or not self.user_requests[user_id]:
+            return 0
+        
+        oldest_request = min(self.user_requests[user_id])
+        return max(0, int(RATE_LIMIT_WINDOW - (time.time() - oldest_request)))
+
+rate_limiter = RateLimiter()
+
+# Database connection management
+class DatabaseManager:
+    def __init__(self, db_path: str = "message_cache.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    @contextmanager
+    def get_connection(self):
+        """Context manager for database connections."""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            yield conn
+        except sqlite3.Error as e:
+            logger.error(f"Database error: {e}")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
+    
+    def init_database(self):
+        """Initialize database tables."""
+        with self.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS personality (
+                    guild_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    system_prompt TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, name)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS personality_active (
+                    guild_id TEXT PRIMARY KEY,
+                    active_name TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            logger.info("Database initialized successfully")
+
+db_manager = DatabaseManager()
+
+# Response chunking utility
+async def send_chunked_response(interaction: discord.Interaction, content: str, ephemeral: bool = False):
+    """Send response in chunks if it exceeds Discord's character limit."""
+    max_length = 2000
+    
+    if len(content) <= max_length:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+        return
+    
+    # Split content into chunks
+    chunks = []
+    current_chunk = ""
+    
+    for line in content.split('\n'):
+        if len(current_chunk) + len(line) + 1 <= max_length:
+            current_chunk += line + '\n'
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = line + '\n'
+    
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    # Send first chunk as response
+    if not interaction.response.is_done():
+        await interaction.response.send_message(chunks[0], ephemeral=ephemeral)
+        chunks = chunks[1:]
+    
+    # Send remaining chunks as followups
+    for chunk in chunks:
+        await interaction.followup.send(chunk, ephemeral=ephemeral)
+
+# OpenAI API wrapper with error handling
+class OpenAIManager:
+    def __init__(self):
+        self.client = OpenAI(api_key=OPENAI_API_KEY)
+    
+    async def create_completion(self, messages: list, max_tokens: int = 300) -> Optional[str]:
+        """Create OpenAI completion with error handling."""
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.7
+            )
+            return response.choices[0].message.content
+        except openai.RateLimitError:
+            logger.warning("OpenAI rate limit exceeded")
+            return "I'm currently experiencing high demand. Please try again in a few moments."
+        except openai.APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            return "I'm experiencing technical difficulties. Please try again later."
+        except Exception as e:
+            logger.error(f"Unexpected error in OpenAI completion: {e}")
+            return "An unexpected error occurred. Please try again."
+
+openai_manager = OpenAIManager()
+
+# Discord bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 bot_name = "GarGPT"
-
 tree = bot.tree
 
-# Load keys from environment
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-ALLOWED_ROLES = os.getenv("ALLOWED_ROLES", "").split(",")  # Comma-separated list
-BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
-openai.api_key = OPENAI_API_KEY
-
-# SQLite setup for caching messages and settings
-conn = sqlite3.connect("message_cache.db")
-c = conn.cursor()
-c.execute("CREATE TABLE IF NOT EXISTS messages (channel TEXT, author TEXT, content TEXT, timestamp TEXT)")
-c.execute("CREATE TABLE IF NOT EXISTS personality (guild_id TEXT, name TEXT, system_prompt TEXT, PRIMARY KEY (guild_id, name))")
-c.execute("CREATE TABLE IF NOT EXISTS personality_active (guild_id TEXT PRIMARY KEY, active_name TEXT)")
-conn.commit()
-
-def is_allowed(interaction):
+def is_allowed(interaction: discord.Interaction) -> bool:
+    """Check if user has permission to use bot commands."""
     if interaction.guild is None:
         return True  # Allow in DMs
+    
+    if not ALLOWED_ROLES:
+        return True  # No role restrictions
+    
     role_names = [role.name for role in interaction.user.roles]
-    return any(allowed.strip() in role_names for allowed in ALLOWED_ROLES if allowed.strip())
+    return any(allowed in role_names for allowed in ALLOWED_ROLES)
 
-def get_personality_prompt(guild_id):
-    c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (str(guild_id),))
-    row = c.fetchone()
-    active_name = row[0] if row else None
-    if not active_name:
+def get_personality_prompt(guild_id: str) -> str:
+    """Get the active personality prompt for a guild."""
+    try:
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            row = c.fetchone()
+            active_name = row['active_name'] if row else None
+            
+            if not active_name:
+                return "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
+            
+            c.execute("SELECT system_prompt FROM personality WHERE guild_id = ? AND name = ?", (guild_id, active_name))
+            row = c.fetchone()
+            return row['system_prompt'] if row else "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
+    except Exception as e:
+        logger.error(f"Error getting personality prompt: {e}")
         return "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
-    c.execute("SELECT system_prompt FROM personality WHERE guild_id = ? AND name = ?", (str(guild_id), active_name))
-    row = c.fetchone()
-    return row[0] if row else "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
 
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"{bot_name} connected as {bot.user}")
+    """Bot ready event handler."""
+    try:
+        await tree.sync()
+        logger.info(f"{bot_name} connected as {bot.user}")
+        print(f"{bot_name} connected as {bot.user}")
+    except Exception as e:
+        logger.error(f"Error syncing commands: {e}")
 
 @bot.event
 async def on_message(message):
+    """Message event handler for caching."""
     if message.author.bot:
         return
-    # Cache messages
-    c.execute("INSERT INTO messages VALUES (?, ?, ?, ?)",
-              (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
-    conn.commit()
+    
+    try:
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO messages (channel, author, content, timestamp) VALUES (?, ?, ?, ?)",
+                     (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error caching message: {e}")
 
 @tree.command(name="ask", description="Ask GPT-4o a question")
 async def ask(interaction: discord.Interaction, prompt: str):
+    """Ask GPT-4o a question."""
     if not is_allowed(interaction):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
+    
+    # Rate limiting check
+    if rate_limiter.is_rate_limited(interaction.user.id):
+        reset_time = rate_limiter.get_reset_time(interaction.user.id)
+        await interaction.response.send_message(
+            f"Rate limit exceeded. Please wait {reset_time} seconds before trying again.", 
+            ephemeral=True
+        )
+        return
+    
     await interaction.response.defer()
-    system_prompt = get_personality_prompt(interaction.guild.id if interaction.guild else "dm")
-    from openai import OpenAI
-    client = OpenAI()
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
+    
+    try:
+        # Sanitize input
+        sanitized_prompt = sanitize_input(prompt)
+        
+        # Get personality and create completion
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        system_prompt = get_personality_prompt(guild_id)
+        
+        messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=300
-    )
-    answer = response.choices[0].message.content
-    await interaction.followup.send(answer[:2000])
+            {"role": "user", "content": sanitized_prompt}
+        ]
+        
+        answer = await openai_manager.create_completion(messages, max_tokens=300)
+        
+        if answer:
+            await send_chunked_response(interaction, answer)
+            logger.info(f"Ask command used by {interaction.user} in {interaction.guild}")
+        else:
+            await interaction.followup.send("I couldn't generate a response. Please try again.")
+            
+    except ValueError as e:
+        await interaction.followup.send(f"Input error: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in ask command: {e}")
+        await interaction.followup.send("An error occurred while processing your request.", ephemeral=True)
 
 @tree.command(name="web", description="Search the web and summarize with GPT-4o")
 async def web(interaction: discord.Interaction, query: str):
+    """Search the web and summarize results with GPT-4o."""
     if not is_allowed(interaction):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
+    
+    # Rate limiting check
+    if rate_limiter.is_rate_limited(interaction.user.id):
+        reset_time = rate_limiter.get_reset_time(interaction.user.id)
+        await interaction.response.send_message(
+            f"Rate limit exceeded. Please wait {reset_time} seconds before trying again.", 
+            ephemeral=True
+        )
+        return
+    
     await interaction.response.defer()
-    headers = {"X-Subscription-Token": BRAVE_API_KEY}
-    params = {"q": query, "count": 3}
-    r = requests.get("https://api.search.brave.com/res/v1/web/search", headers=headers, params=params)
-    if r.status_code != 200:
-        await interaction.followup.send("Web search failed. Check your Brave API key or try again later.")
-        return
-    results = r.json().get("web", {}).get("results", [])
-    if not results:
-        await interaction.followup.send("No web results found.")
-        return
-    snippets = "
-
-".join([f"Title: {r['title']}
-URL: {r['url']}
-Snippet: {r['description']}" for r in results])
-    system_prompt = get_personality_prompt(interaction.guild.id if interaction.guild else "dm")
-    from openai import OpenAI
-    client = OpenAI()
-    summary = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
+    
+    try:
+        # Sanitize input
+        sanitized_query = sanitize_input(query)
+        
+        # Perform web search
+        headers = {"X-Subscription-Token": BRAVE_API_KEY}
+        params = {"q": sanitized_query, "count": 3}
+        
+        r = requests.get("https://api.search.brave.com/res/v1/web/search", 
+                        headers=headers, params=params, timeout=10)
+        
+        if r.status_code != 200:
+            await interaction.followup.send("Web search failed. Please try again later.")
+            logger.warning(f"Brave API returned status code: {r.status_code}")
+            return
+        
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            await interaction.followup.send("No web results found.")
+            return
+        
+        # Format search results
+        snippets = "\n\n".join([
+            f"Title: {r['title']}\nURL: {r['url']}\nSnippet: {r['description']}" 
+            for r in results
+        ])
+        
+        # Get personality and create summary
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        system_prompt = get_personality_prompt(guild_id)
+        
+        messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Summarize these search results and answer the query: {query}
-
-{snippets}"}
-        ],
-        max_tokens=400
-    )
-    answer = summary.choices[0].message.content
-    await interaction.followup.send(answer[:2000])
+            {"role": "user", "content": f"Summarize these search results and answer the query: {sanitized_query}\n\n{snippets}"}
+        ]
+        
+        answer = await openai_manager.create_completion(messages, max_tokens=400)
+        
+        if answer:
+            await send_chunked_response(interaction, answer)
+            logger.info(f"Web command used by {interaction.user} in {interaction.guild}")
+        else:
+            await interaction.followup.send("I couldn't generate a summary. Please try again.")
+            
+    except ValueError as e:
+        await interaction.followup.send(f"Input error: {str(e)}", ephemeral=True)
+    except requests.RequestException as e:
+        logger.error(f"Web search request error: {e}")
+        await interaction.followup.send("Web search failed due to network issues. Please try again.")
+    except Exception as e:
+        logger.error(f"Error in web command: {e}")
+        await interaction.followup.send("An error occurred while processing your request.", ephemeral=True)
 
 @tree.command(name="status", description="Show current bot status and runtime info")
 async def status(interaction: discord.Interaction):
-    import time
-    import datetime
-    uptime = time.time() - bot.start_time
-    uptime_str = str(datetime.timedelta(seconds=int(uptime)))
-    guild_id = str(interaction.guild.id) if interaction.guild else "dm"
-    c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
-    row = c.fetchone()
-    personality = row[0] if row else "default"
-    latency_ms = round(bot.latency * 1000)
-    status_msg = f"""
-**GarGPT Status**
-Model: GPT-4o (May 2024)
+    """Show bot status information."""
+    try:
+        uptime = time.time() - bot.start_time
+        uptime_str = str(timedelta(seconds=int(uptime)))
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            row = c.fetchone()
+            personality = row['active_name'] if row else "default"
+        
+        latency_ms = round(bot.latency * 1000)
+        
+        status_msg = f"""**GarGPT Status**
+Model: GPT-4o
 Active Personality: `{personality}`
 Uptime: `{uptime_str}`
 Latency: `{latency_ms} ms`
-"""
-    await interaction.response.send_message(status_msg.strip())
+Rate Limit: {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s"""
+        
+        await interaction.response.send_message(status_msg.strip())
+        
+    except Exception as e:
+        logger.error(f"Error in status command: {e}")
+        await interaction.response.send_message("Error retrieving status information.", ephemeral=True)
+
+@tree.command(name="setpersonality", description="Save and set a new personality")
+@app_commands.describe(name="The personality name", prompt="The system prompt for this personality")
+async def setpersonality(interaction: discord.Interaction, name: str, prompt: str):
+    """Save and set a new personality."""
+    if not is_allowed(interaction):
+        await interaction.response.send_message("You don't have permission to set personalities.", ephemeral=True)
+        return
+    
+    try:
+        # Sanitize inputs
+        sanitized_name = sanitize_input(name, 50)
+        sanitized_prompt = sanitize_input(prompt, 1000)
+        
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO personality VALUES (?, ?, ?)", 
+                     (guild_id, sanitized_name, sanitized_prompt))
+            c.execute("INSERT OR REPLACE INTO personality_active VALUES (?, ?)", 
+                     (guild_id, sanitized_name))
+            conn.commit()
+        
+        await interaction.response.send_message(f"Set personality '{sanitized_name}' and made it active for this server.")
+        logger.info(f"Personality '{sanitized_name}' set by {interaction.user} in {interaction.guild}")
+        
+    except ValueError as e:
+        await interaction.response.send_message(f"Input error: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in setpersonality command: {e}")
+        await interaction.response.send_message("Error setting personality.", ephemeral=True)
+
+@tree.command(name="usepersonality", description="Switch to a saved personality")
+@app_commands.describe(name="The personality name to use")
+async def usepersonality(interaction: discord.Interaction, name: str):
+    """Switch to a saved personality."""
+    if not is_allowed(interaction):
+        await interaction.response.send_message("You don't have permission to use personalities.", ephemeral=True)
+        return
+    
+    try:
+        sanitized_name = sanitize_input(name, 50)
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT name FROM personality WHERE guild_id = ? AND name = ?", 
+                     (guild_id, sanitized_name))
+            if not c.fetchone():
+                await interaction.response.send_message(f"Personality '{sanitized_name}' not found for this server.", ephemeral=True)
+                return
+            
+            c.execute("INSERT OR REPLACE INTO personality_active VALUES (?, ?)", 
+                     (guild_id, sanitized_name))
+            conn.commit()
+        
+        await interaction.response.send_message(f"Switched to personality '{sanitized_name}' for this server.")
+        logger.info(f"Switched to personality '{sanitized_name}' by {interaction.user} in {interaction.guild}")
+        
+    except ValueError as e:
+        await interaction.response.send_message(f"Input error: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in usepersonality command: {e}")
+        await interaction.response.send_message("Error switching personality.", ephemeral=True)
+
+@tree.command(name="listpersonalities", description="View all saved personalities")
+async def listpersonalities(interaction: discord.Interaction):
+    """List all saved personalities."""
+    try:
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT name, system_prompt FROM personality WHERE guild_id = ?", (guild_id,))
+            personalities = c.fetchall()
+            
+            if not personalities:
+                await interaction.response.send_message("No personalities saved for this server.", ephemeral=True)
+                return
+            
+            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            active_row = c.fetchone()
+            active_name = active_row['active_name'] if active_row else None
+        
+        personality_list = "**Saved Personalities:**\n\n"
+        for row in personalities:
+            name, prompt = row['name'], row['system_prompt']
+            status = " ✅ (Active)" if name == active_name else ""
+            personality_list += f"**{name}**{status}\n{prompt[:100]}{'...' if len(prompt) > 100 else ''}\n\n"
+        
+        await send_chunked_response(interaction, personality_list, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Error in listpersonalities command: {e}")
+        await interaction.response.send_message("Error retrieving personalities.", ephemeral=True)
 
 @tree.command(name="deletepersonality", description="Delete a saved personality")
 @app_commands.describe(name="The personality name to delete")
 async def deletepersonality(interaction: discord.Interaction, name: str):
+    """Delete a saved personality."""
     if not is_allowed(interaction):
         await interaction.response.send_message("You don't have permission to delete personalities.", ephemeral=True)
         return
-    guild_id = str(interaction.guild.id)
-    c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
-    row = c.fetchone()
-    if row and row[0] == name:
-        c.execute("DELETE FROM personality_active WHERE guild_id = ?", (guild_id,))
-    c.execute("DELETE FROM personality WHERE guild_id = ? AND name = ?", (guild_id, name))
-    conn.commit()
-    await interaction.response.send_message(f"Deleted personality '{name}' for this server.")
-
+    
+    try:
+        sanitized_name = sanitize_input(name, 50)
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            row = c.fetchone()
+            if row and row['active_name'] == sanitized_name:
+                c.execute("DELETE FROM personality_active WHERE guild_id = ?", (guild_id,))
+            
+            c.execute("DELETE FROM personality WHERE guild_id = ? AND name = ?", (guild_id, sanitized_name))
+            conn.commit()
+        
+        await interaction.response.send_message(f"Deleted personality '{sanitized_name}' for this server.")
+        logger.info(f"Personality '{sanitized_name}' deleted by {interaction.user} in {interaction.guild}")
+        
+    except ValueError as e:
+        await interaction.response.send_message(f"Input error: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in deletepersonality command: {e}")
+        await interaction.response.send_message("Error deleting personality.", ephemeral=True)
 
 @tree.command(name="help", description="Show a list of available GarGPT commands")
 async def help_command(interaction: discord.Interaction):
-    help_text = """
-**GarGPT Slash Commands**
+    """Show help information."""
+    help_text = """**GarGPT Slash Commands**
 
-🧠 Personality Control:
-/setpersonality [name] [prompt] — Save and set a new personality  
-/usepersonality [name] — Switch to a saved personality  
-/listpersonalities — View all saved personalities  
-/deletepersonality [name] — Delete a saved personality  
+🧠 **Personality Control:**
+`/setpersonality [name] [prompt]` — Save and set a new personality  
+`/usepersonality [name]` — Switch to a saved personality  
+`/listpersonalities` — View all saved personalities  
+`/deletepersonality [name]` — Delete a saved personality  
 
-💬 Chat + Search:
-/ask [prompt] — Ask GPT-4o a question  
-/web [query] — Search the web and summarize results  
+💬 **Chat + Search:**
+`/ask [prompt]` — Ask GPT-4o a question  
+`/web [query]` — Search the web and summarize results  
 
-📊 Status:
-/status — Show uptime, latency, and active personality  
-"""
+📊 **Status:**
+`/status` — Show uptime, latency, and active personality  
+
+⚡ **Rate Limits:**
+{RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds per user"""
+    
     await interaction.response.send_message(help_text.strip(), ephemeral=True)
 
+# Error handling for the bot
+@bot.event
+async def on_error(event, *args, **kwargs):
+    """Global error handler."""
+    logger.error(f"Bot error in {event}: {args}, {kwargs}")
 
-import time
+@bot.event
+async def on_command_error(ctx, error):
+    """Command error handler."""
+    logger.error(f"Command error: {error}")
+
+# Initialize bot start time
 bot.start_time = time.time()
 
 if __name__ == "__main__":
+    logger.info("Starting GarGPT bot...")
     print("Launching bot...")
-    bot.run(DISCORD_BOT_TOKEN)
+    try:
+        bot.run(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        logger.critical(f"Failed to start bot: {e}")
+        raise
