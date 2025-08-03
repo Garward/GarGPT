@@ -537,12 +537,15 @@ def similarity_score(a: str, b: str) -> float:
 def find_best_user_match(guild: discord.Guild, target_name: str, guild_id: str) -> Optional[discord.Member]:
     """Find the best matching user in the guild by name, display name, or alias."""
     if not guild or not target_name:
+        logger.debug(f"Invalid input for user matching: guild={guild}, target_name='{target_name}'")
         return None
     
     target_name = target_name.lower().strip()
     best_match = None
     best_score = 0.0
-    min_threshold = 0.6  # Minimum similarity threshold
+    min_threshold = 0.5  # Lowered threshold for better matching
+    
+    logger.debug(f"Searching for user: '{target_name}' in guild {guild.name}")
     
     try:
         # Get all user aliases for this guild
@@ -560,44 +563,71 @@ def find_best_user_match(guild: discord.Guild, target_name: str, guild_id: str) 
                 if user_id and alias:
                     user_aliases[user_id] = alias.lower()
         
+        logger.debug(f"Found {len(user_aliases)} aliases in database")
+        
         # Check all guild members
+        candidates = []
         for member in guild.members:
             if member.bot:  # Skip bots
                 continue
             
             member_id = str(member.id)
             scores = []
+            names_checked = []
             
             # Check username
             if member.name:
-                scores.append(similarity_score(target_name, member.name))
+                score = similarity_score(target_name, member.name)
+                scores.append(score)
+                names_checked.append(f"username:{member.name}({score:.2f})")
             
             # Check display name
             if member.display_name and member.display_name != member.name:
-                scores.append(similarity_score(target_name, member.display_name))
+                score = similarity_score(target_name, member.display_name)
+                scores.append(score)
+                names_checked.append(f"display:{member.display_name}({score:.2f})")
             
             # Check nickname
             if member.nick:
-                scores.append(similarity_score(target_name, member.nick))
+                score = similarity_score(target_name, member.nick)
+                scores.append(score)
+                names_checked.append(f"nick:{member.nick}({score:.2f})")
             
             # Check alias from database
             if member_id in user_aliases:
-                scores.append(similarity_score(target_name, user_aliases[member_id]))
+                score = similarity_score(target_name, user_aliases[member_id])
+                scores.append(score)
+                names_checked.append(f"alias:{user_aliases[member_id]}({score:.2f})")
             
             # Get the best score for this member
             if scores:
                 member_best_score = max(scores)
-                if member_best_score > best_score and member_best_score >= min_threshold:
-                    best_score = member_best_score
-                    best_match = member
+                if member_best_score >= min_threshold:
+                    candidates.append({
+                        'member': member,
+                        'score': member_best_score,
+                        'names': names_checked
+                    })
+                    if member_best_score > best_score:
+                        best_score = member_best_score
+                        best_match = member
         
+        # Log matching results
         if best_match:
-            logger.info(f"Found user match: {target_name} -> {best_match.display_name} (score: {best_score:.2f})")
+            logger.info(f"✅ User match found: '{target_name}' -> {best_match.display_name} (score: {best_score:.2f})")
+        else:
+            logger.warning(f"❌ No user match found for: '{target_name}' (threshold: {min_threshold})")
+            if candidates:
+                logger.debug(f"Close candidates below threshold:")
+                for candidate in sorted(candidates, key=lambda x: x['score'], reverse=True)[:3]:
+                    logger.debug(f"  - {candidate['member'].display_name}: {candidate['score']:.2f} {candidate['names']}")
+            else:
+                logger.debug(f"No candidates found above threshold {min_threshold}")
         
         return best_match
         
     except Exception as e:
-        logger.error(f"Error finding user match: {e}")
+        logger.error(f"Error finding user match for '{target_name}': {e}")
         return None
 
 def detect_ping_keywords_and_users(content: str, guild: discord.Guild, guild_id: str) -> Tuple[bool, List[discord.Member]]:
@@ -612,55 +642,72 @@ def detect_ping_keywords_and_users(content: str, guild: discord.Guild, guild_id:
     has_ping_keyword = any(keyword in content_lower for keyword in ping_keywords)
     
     if not has_ping_keyword:
+        logger.debug(f"No ping keywords found in: '{content}'")
         return False, []
+    
+    logger.debug(f"Ping keywords detected in: '{content}'")
     
     # Extract potential user names after ping keywords
     users_to_ping = []
+    found_names = set()
     
-    # Pattern to find names after ping keywords
-    # Matches: "ping john", "notify @alice", "poke bob please", etc.
+    # Improved patterns to handle names with spaces and complex usernames
     ping_patterns = [
-        r'\b(?:ping|poke|notify|nudge|alert|mention|call|summon|get)\s+@?(\w+)',
-        r'\b(?:ping|poke|notify|nudge|alert|mention|call|summon|get)\s+@?([a-zA-Z0-9_]+)',
-        r'@?(\w+)\s+(?:please|pls|plz)?\s*$',  # Names at the end
+        # Pattern for "ping Username With Spaces" - captures until common stop words or punctuation
+        r'\b(?:ping|poke|notify|nudge|alert|mention|call|summon|get)\s+@?([a-zA-Z0-9\s_-]+?)(?:\s+(?:about|that|please|pls|plz|to|and|or|but|in|on|at|for|with|by|from)|\.|!|\?|$)',
+        # Pattern for quoted names: "ping 'John Doe'" or 'ping "Jane Smith"'
+        r'\b(?:ping|poke|notify|nudge|alert|mention|call|summon|get)\s+["\']([^"\']+)["\']',
+        # Pattern for @mentions: "ping @username"
+        r'\b(?:ping|poke|notify|nudge|alert|mention|call|summon|get)\s+@([a-zA-Z0-9\s_-]+)',
     ]
     
-    found_names = set()
     for pattern in ping_patterns:
         matches = re.finditer(pattern, content_lower)
         for match in matches:
             name = match.group(1).strip()
             if len(name) > 1:  # Avoid single characters
                 found_names.add(name)
+                logger.debug(f"Found potential name from pattern: '{name}'")
     
-    # Also look for standalone names that might be usernames
-    # Pattern for potential usernames (alphanumeric + underscore, 2+ chars)
-    username_pattern = r'\b([a-zA-Z][a-zA-Z0-9_]{1,})\b'
-    potential_names = re.findall(username_pattern, content)
-    
-    # Filter out common words that aren't likely to be usernames
-    common_words = {
-        'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
-        'from', 'up', 'about', 'into', 'through', 'during', 'before', 'after', 'above',
-        'below', 'between', 'among', 'this', 'that', 'these', 'those', 'i', 'you', 'he',
-        'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his',
-        'her', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs', 'am',
-        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do',
-        'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can',
-        'please', 'thanks', 'thank', 'hello', 'hi', 'hey', 'yes', 'no', 'ok', 'okay'
-    }
-    
-    for name in potential_names:
-        if name.lower() not in common_words and len(name) > 2:
-            found_names.add(name.lower())
+    # Also look for names in context - if ping keyword is present, check for capitalized words
+    # that might be usernames (but be more selective)
+    if has_ping_keyword:
+        # Look for capitalized words that might be names
+        capitalized_pattern = r'\b([A-Z][a-zA-Z0-9\s_-]*(?:\s+[A-Z][a-zA-Z0-9_-]*)*)\b'
+        capitalized_matches = re.findall(capitalized_pattern, content)
+        
+        # Filter out common words and short matches
+        common_words = {
+            'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+            'from', 'up', 'about', 'into', 'through', 'during', 'before', 'after', 'above',
+            'below', 'between', 'among', 'this', 'that', 'these', 'those', 'i', 'you', 'he',
+            'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his',
+            'her', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs', 'am',
+            'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do',
+            'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can',
+            'please', 'thanks', 'thank', 'hello', 'hi', 'hey', 'yes', 'no', 'ok', 'okay',
+            'gargpt', 'bot', 'discord', 'server', 'channel', 'message', 'user', 'admin'
+        }
+        
+        for name in capitalized_matches:
+            name_clean = name.strip()
+            if (len(name_clean) > 2 and
+                name_clean.lower() not in common_words and
+                not name_clean.lower().startswith('http')):
+                found_names.add(name_clean.lower())
+                logger.debug(f"Found potential capitalized name: '{name_clean}'")
     
     # Find matching users for each name
     for name in found_names:
+        logger.debug(f"Attempting to match user: '{name}'")
         user_match = find_best_user_match(guild, name, guild_id)
         if user_match and user_match not in users_to_ping:
             users_to_ping.append(user_match)
+            logger.debug(f"✅ Matched '{name}' to user: {user_match.display_name}")
+        else:
+            logger.debug(f"❌ No match found for: '{name}'")
     
-    logger.info(f"Ping detection: keywords={has_ping_keyword}, names={list(found_names)}, users={[u.display_name for u in users_to_ping]}")
+    logger.info(f"Ping detection result: keywords={has_ping_keyword}, found_names={list(found_names)}, matched_users={[u.display_name for u in users_to_ping]}")
     
     return has_ping_keyword, users_to_ping
 
@@ -761,19 +808,23 @@ async def on_message(message):
                 await message.reply("Hi! You mentioned me but didn't ask anything. Try asking me a question!", mention_author=False)
                 return
             
-            # Check for alias setting request
+            # Check for alias setting request - improved patterns to capture full phrases
             alias_patterns = [
-                r"call me (\w+)",
-                r"my name is (\w+)",
-                r"i'm (\w+)",
-                r"i am (\w+)",
-                r"refer to me as (\w+)"
+                r"call me ([a-zA-Z0-9\s_-]+?)(?:\s+(?:please|pls|plz|from now on|in this server)|\.|!|$)",
+                r"my name is ([a-zA-Z0-9\s_-]+?)(?:\s+(?:please|pls|plz|from now on|in this server)|\.|!|$)",
+                r"i'm ([a-zA-Z0-9\s_-]+?)(?:\s+(?:please|pls|plz|from now on|in this server)|\.|!|$)",
+                r"i am ([a-zA-Z0-9\s_-]+?)(?:\s+(?:please|pls|plz|from now on|in this server)|\.|!|$)",
+                r"refer to me as ([a-zA-Z0-9\s_-]+?)(?:\s+(?:please|pls|plz|from now on|in this server)|\.|!|$)"
             ]
             
             for pattern in alias_patterns:
                 match = re.search(pattern, content.lower())
                 if match:
-                    alias = match.group(1)
+                    alias = match.group(1).strip()
+                    # Skip if alias is too short or contains common words that aren't names
+                    if len(alias) < 2 or alias.lower() in ['called', 'what', 'am', 'is', 'are', 'the', 'a', 'an']:
+                        continue
+                    
                     guild_id = str(message.guild.id) if message.guild else "dm"
                     user_id = str(message.author.id)
                     
