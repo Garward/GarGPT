@@ -10,9 +10,10 @@ import logging
 import time
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
 from discord import app_commands
+from difflib import SequenceMatcher
 
 # Try to import PostgreSQL support
 try:
@@ -529,6 +530,153 @@ def is_creator(user_id: str, username: str, alias: Optional[str] = None) -> bool
     
     return False
 
+def similarity_score(a: str, b: str) -> float:
+    """Calculate similarity score between two strings using SequenceMatcher."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def find_best_user_match(guild: discord.Guild, target_name: str, guild_id: str) -> Optional[discord.Member]:
+    """Find the best matching user in the guild by name, display name, or alias."""
+    if not guild or not target_name:
+        return None
+    
+    target_name = target_name.lower().strip()
+    best_match = None
+    best_score = 0.0
+    min_threshold = 0.6  # Minimum similarity threshold
+    
+    try:
+        # Get all user aliases for this guild
+        user_aliases = {}
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            if db_manager.use_postgres:
+                c.execute("SELECT user_id, alias FROM user_aliases WHERE guild_id = %s", (guild_id,))
+            else:
+                c.execute("SELECT user_id, alias FROM user_aliases WHERE guild_id = ?", (guild_id,))
+            
+            for row in c.fetchall():
+                user_id = get_row_value(row, 'user_id', 0)
+                alias = get_row_value(row, 'alias', 1)
+                if user_id and alias:
+                    user_aliases[user_id] = alias.lower()
+        
+        # Check all guild members
+        for member in guild.members:
+            if member.bot:  # Skip bots
+                continue
+            
+            member_id = str(member.id)
+            scores = []
+            
+            # Check username
+            if member.name:
+                scores.append(similarity_score(target_name, member.name))
+            
+            # Check display name
+            if member.display_name and member.display_name != member.name:
+                scores.append(similarity_score(target_name, member.display_name))
+            
+            # Check nickname
+            if member.nick:
+                scores.append(similarity_score(target_name, member.nick))
+            
+            # Check alias from database
+            if member_id in user_aliases:
+                scores.append(similarity_score(target_name, user_aliases[member_id]))
+            
+            # Get the best score for this member
+            if scores:
+                member_best_score = max(scores)
+                if member_best_score > best_score and member_best_score >= min_threshold:
+                    best_score = member_best_score
+                    best_match = member
+        
+        if best_match:
+            logger.info(f"Found user match: {target_name} -> {best_match.display_name} (score: {best_score:.2f})")
+        
+        return best_match
+        
+    except Exception as e:
+        logger.error(f"Error finding user match: {e}")
+        return None
+
+def detect_ping_keywords_and_users(content: str, guild: discord.Guild, guild_id: str) -> Tuple[bool, List[discord.Member]]:
+    """Detect ping keywords and extract user names to mention."""
+    ping_keywords = [
+        "ping", "poke", "notify", "nudge", "alert", "mention", "call", "summon", "get"
+    ]
+    
+    content_lower = content.lower()
+    
+    # Check if any ping keywords are present
+    has_ping_keyword = any(keyword in content_lower for keyword in ping_keywords)
+    
+    if not has_ping_keyword:
+        return False, []
+    
+    # Extract potential user names after ping keywords
+    users_to_ping = []
+    
+    # Pattern to find names after ping keywords
+    # Matches: "ping john", "notify @alice", "poke bob please", etc.
+    ping_patterns = [
+        r'\b(?:ping|poke|notify|nudge|alert|mention|call|summon|get)\s+@?(\w+)',
+        r'\b(?:ping|poke|notify|nudge|alert|mention|call|summon|get)\s+@?([a-zA-Z0-9_]+)',
+        r'@?(\w+)\s+(?:please|pls|plz)?\s*$',  # Names at the end
+    ]
+    
+    found_names = set()
+    for pattern in ping_patterns:
+        matches = re.finditer(pattern, content_lower)
+        for match in matches:
+            name = match.group(1).strip()
+            if len(name) > 1:  # Avoid single characters
+                found_names.add(name)
+    
+    # Also look for standalone names that might be usernames
+    # Pattern for potential usernames (alphanumeric + underscore, 2+ chars)
+    username_pattern = r'\b([a-zA-Z][a-zA-Z0-9_]{1,})\b'
+    potential_names = re.findall(username_pattern, content)
+    
+    # Filter out common words that aren't likely to be usernames
+    common_words = {
+        'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+        'from', 'up', 'about', 'into', 'through', 'during', 'before', 'after', 'above',
+        'below', 'between', 'among', 'this', 'that', 'these', 'those', 'i', 'you', 'he',
+        'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his',
+        'her', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs', 'am',
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do',
+        'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can',
+        'please', 'thanks', 'thank', 'hello', 'hi', 'hey', 'yes', 'no', 'ok', 'okay'
+    }
+    
+    for name in potential_names:
+        if name.lower() not in common_words and len(name) > 2:
+            found_names.add(name.lower())
+    
+    # Find matching users for each name
+    for name in found_names:
+        user_match = find_best_user_match(guild, name, guild_id)
+        if user_match and user_match not in users_to_ping:
+            users_to_ping.append(user_match)
+    
+    logger.info(f"Ping detection: keywords={has_ping_keyword}, names={list(found_names)}, users={[u.display_name for u in users_to_ping]}")
+    
+    return has_ping_keyword, users_to_ping
+
+def format_user_mentions(users: List[discord.Member]) -> str:
+    """Format a list of users into Discord mentions."""
+    if not users:
+        return ""
+    
+    mentions = [user.mention for user in users]
+    if len(mentions) == 1:
+        return mentions[0]
+    elif len(mentions) == 2:
+        return f"{mentions[0]} and {mentions[1]}"
+    else:
+        return f"{', '.join(mentions[:-1])}, and {mentions[-1]}"
+
 def get_personality_prompt(guild_id: str) -> str:
     """Get the active personality prompt for a guild."""
     try:
@@ -649,6 +797,11 @@ async def on_message(message):
                     username = message.author.display_name or message.author.name
                     user_alias = get_user_alias(guild_id, user_id)
                     
+                    # Check for ping keywords and users to mention
+                    users_to_ping = []
+                    if message.guild:  # Only in guilds, not DMs
+                        has_ping_keyword, users_to_ping = detect_ping_keywords_and_users(content, message.guild, guild_id)
+                    
                     # Get personality and channel context
                     system_prompt = get_personality_prompt(guild_id)
                     
@@ -673,6 +826,14 @@ async def on_message(message):
                         messages_for_ai.append({
                             "role": "system",
                             "content": f"The user prefers to be called '{user_alias}' instead of their username '{username}'. Use their preferred name when addressing them."
+                        })
+                    
+                    # Add ping context if users were detected
+                    if users_to_ping:
+                        ping_context = f"The user wants to ping/notify these users: {', '.join([u.display_name for u in users_to_ping])}. Include their mentions in your response naturally."
+                        messages_for_ai.append({
+                            "role": "system",
+                            "content": ping_context
                         })
                     
                     # Add recent message history as context
@@ -701,6 +862,13 @@ async def on_message(message):
                     answer = await openai_manager.create_completion(messages_for_ai, max_tokens=400)
                     
                     if answer:
+                        # Add user mentions to the response if detected
+                        if users_to_ping:
+                            user_mentions = format_user_mentions(users_to_ping)
+                            # Add mentions at the end if not already included
+                            if not any(user.mention in answer for user in users_to_ping):
+                                answer = f"{answer}\n\n{user_mentions}"
+                        
                         # Split response if too long for Discord
                         if len(answer) <= 2000:
                             await message.reply(answer, mention_author=False)
@@ -727,7 +895,10 @@ async def on_message(message):
                             for chunk in chunks[1:]:
                                 await message.channel.send(chunk)
                         
-                        logger.info(f"Mention response sent to {message.author} in {message.guild}")
+                        if users_to_ping:
+                            logger.info(f"Mention response with pings sent to {message.author} in {message.guild}, pinged: {[u.display_name for u in users_to_ping]}")
+                        else:
+                            logger.info(f"Mention response sent to {message.author} in {message.guild}")
                     else:
                         await message.reply("I couldn't generate a response. Please try again.", mention_author=False)
                         
@@ -767,11 +938,24 @@ async def ask(interaction: discord.Interaction, prompt: str):
         channel_id = str(interaction.channel.id)
         system_prompt = get_personality_prompt(guild_id)
         
+        # Check for ping keywords and users to mention
+        users_to_ping = []
+        if interaction.guild:  # Only in guilds, not DMs
+            has_ping_keyword, users_to_ping = detect_ping_keywords_and_users(prompt, interaction.guild, guild_id)
+        
         # Get recent messages for context
         recent_messages = get_recent_messages(channel_id, limit=10)
         
         # Build conversation history for OpenAI
         messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add ping context if users were detected
+        if users_to_ping:
+            ping_context = f"The user wants to ping/notify these users: {', '.join([u.display_name for u in users_to_ping])}. Include their mentions in your response naturally."
+            messages.append({
+                "role": "system",
+                "content": ping_context
+            })
         
         # Add recent message history as context
         if recent_messages:
@@ -801,8 +985,19 @@ async def ask(interaction: discord.Interaction, prompt: str):
         answer = await openai_manager.create_completion(messages, max_tokens=400)
         
         if answer:
+            # Add user mentions to the response if detected
+            if users_to_ping:
+                user_mentions = format_user_mentions(users_to_ping)
+                # Add mentions at the end if not already included
+                if not any(user.mention in answer for user in users_to_ping):
+                    answer = f"{answer}\n\n{user_mentions}"
+            
             await send_chunked_response(interaction, answer)
-            logger.info(f"Context-aware ask command used by {interaction.user} in {interaction.guild}")
+            
+            if users_to_ping:
+                logger.info(f"Context-aware ask command with pings used by {interaction.user} in {interaction.guild}, pinged: {[u.display_name for u in users_to_ping]}")
+            else:
+                logger.info(f"Context-aware ask command used by {interaction.user} in {interaction.guild}")
         else:
             await interaction.followup.send("I couldn't generate a response. Please try again.")
             
@@ -1199,6 +1394,10 @@ async def help_command(interaction: discord.Interaction):
 `/setalias [nickname]` — Set your preferred nickname for this server
 `/myalias` — Check what nickname the bot has for you
 *Natural language: "@GarGPT call me [name]" also works!*
+🔔 **Smart Pinging:**
+Use keywords like "ping", "poke", "notify", "nudge" with usernames
+*Example: "@GarGPT ping john about the meeting" or "/ask notify alice"*
+*The bot will find users by name, nickname, or alias and mention them!*
 
 � 📊 **Status:**
 `/status` — Show uptime, latency, and active personality
@@ -1208,6 +1407,7 @@ async def help_command(interaction: discord.Interaction):
 
 **Special Features:**
 • **Context Awareness** — The bot remembers recent conversation history
+• **Smart User Matching** — Fuzzy matching for usernames and aliases
 • **Creator Recognition** — Special acknowledgment for Garward/Gar
 • **Dual Database** — PostgreSQL with SQLite fallback support"""
     
