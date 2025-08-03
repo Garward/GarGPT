@@ -586,12 +586,12 @@ Rate Limit: {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s"""
         logger.error(f"Error in status command: {e}")
         await interaction.response.send_message("Error retrieving status information.", ephemeral=True)
 
-@tree.command(name="setpersonality", description="Save and set a new personality")
+@tree.command(name="createpersonality", description="Create a new personality (without activating it)")
 @app_commands.describe(name="The personality name", prompt="The system prompt for this personality")
-async def setpersonality(interaction: discord.Interaction, name: str, prompt: str):
-    """Save and set a new personality."""
+async def createpersonality(interaction: discord.Interaction, name: str, prompt: str):
+    """Create a new personality without activating it."""
     if not is_allowed(interaction):
-        await interaction.response.send_message("You don't have permission to set personalities.", ephemeral=True)
+        await interaction.response.send_message("You don't have permission to create personalities.", ephemeral=True)
         return
     
     try:
@@ -603,26 +603,80 @@ async def setpersonality(interaction: discord.Interaction, name: str, prompt: st
         
         with db_manager.get_connection() as conn:
             c = conn.cursor()
+            
+            # Check if personality already exists
             if db_manager.use_postgres:
-                c.execute("INSERT INTO personality (guild_id, name, system_prompt) VALUES (%s, %s, %s) ON CONFLICT (guild_id, name) DO UPDATE SET system_prompt = EXCLUDED.system_prompt, created_at = CURRENT_TIMESTAMP",
-                         (guild_id, sanitized_name, sanitized_prompt))
-                c.execute("INSERT INTO personality_active (guild_id, active_name) VALUES (%s, %s) ON CONFLICT (guild_id) DO UPDATE SET active_name = EXCLUDED.active_name, updated_at = CURRENT_TIMESTAMP",
-                         (guild_id, sanitized_name))
+                c.execute("SELECT name FROM personality WHERE guild_id = %s AND name = %s", (guild_id, sanitized_name))
             else:
-                c.execute("INSERT OR REPLACE INTO personality VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                c.execute("SELECT name FROM personality WHERE guild_id = ? AND name = ?", (guild_id, sanitized_name))
+            
+            if c.fetchone():
+                await interaction.response.send_message(f"Personality '{sanitized_name}' already exists. Use `/updatepersonality` to modify it or `/usepersonality` to activate it.", ephemeral=True)
+                return
+            
+            # Create new personality
+            if db_manager.use_postgres:
+                c.execute("INSERT INTO personality (guild_id, name, system_prompt) VALUES (%s, %s, %s)",
                          (guild_id, sanitized_name, sanitized_prompt))
-                c.execute("INSERT OR REPLACE INTO personality_active VALUES (?, ?, CURRENT_TIMESTAMP)",
-                         (guild_id, sanitized_name))
+            else:
+                c.execute("INSERT INTO personality VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                         (guild_id, sanitized_name, sanitized_prompt))
             conn.commit()
         
-        await interaction.response.send_message(f"Set personality '{sanitized_name}' and made it active for this server.")
-        logger.info(f"Personality '{sanitized_name}' set by {interaction.user} in {interaction.guild}")
+        await interaction.response.send_message(f"Created personality '{sanitized_name}'. Use `/usepersonality {sanitized_name}` to activate it.")
+        logger.info(f"Personality '{sanitized_name}' created by {interaction.user} in {interaction.guild}")
         
     except ValueError as e:
         await interaction.response.send_message(f"Input error: {str(e)}", ephemeral=True)
     except Exception as e:
-        logger.error(f"Error in setpersonality command: {e}")
-        await interaction.response.send_message("Error setting personality.", ephemeral=True)
+        logger.error(f"Error in createpersonality command: {e}")
+        await interaction.response.send_message("Error creating personality.", ephemeral=True)
+
+@tree.command(name="updatepersonality", description="Update an existing personality")
+@app_commands.describe(name="The personality name to update", prompt="The new system prompt for this personality")
+async def updatepersonality(interaction: discord.Interaction, name: str, prompt: str):
+    """Update an existing personality."""
+    if not is_allowed(interaction):
+        await interaction.response.send_message("You don't have permission to update personalities.", ephemeral=True)
+        return
+    
+    try:
+        # Sanitize inputs
+        sanitized_name = sanitize_input(name, 50)
+        sanitized_prompt = sanitize_input(prompt, 1000)
+        
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            
+            # Check if personality exists
+            if db_manager.use_postgres:
+                c.execute("SELECT name FROM personality WHERE guild_id = %s AND name = %s", (guild_id, sanitized_name))
+            else:
+                c.execute("SELECT name FROM personality WHERE guild_id = ? AND name = ?", (guild_id, sanitized_name))
+            
+            if not c.fetchone():
+                await interaction.response.send_message(f"Personality '{sanitized_name}' not found. Use `/createpersonality` to create it first.", ephemeral=True)
+                return
+            
+            # Update personality
+            if db_manager.use_postgres:
+                c.execute("UPDATE personality SET system_prompt = %s, created_at = CURRENT_TIMESTAMP WHERE guild_id = %s AND name = %s",
+                         (sanitized_prompt, guild_id, sanitized_name))
+            else:
+                c.execute("UPDATE personality SET system_prompt = ?, created_at = CURRENT_TIMESTAMP WHERE guild_id = ? AND name = ?",
+                         (sanitized_prompt, guild_id, sanitized_name))
+            conn.commit()
+        
+        await interaction.response.send_message(f"Updated personality '{sanitized_name}'.")
+        logger.info(f"Personality '{sanitized_name}' updated by {interaction.user} in {interaction.guild}")
+        
+    except ValueError as e:
+        await interaction.response.send_message(f"Input error: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in updatepersonality command: {e}")
+        await interaction.response.send_message("Error updating personality.", ephemeral=True)
 
 @tree.command(name="usepersonality", description="Switch to a saved personality")
 @app_commands.describe(name="The personality name to use")
@@ -754,10 +808,11 @@ async def help_command(interaction: discord.Interaction):
     help_text = """**GarGPT Slash Commands**
 
 🧠 **Personality Control:**
-`/setpersonality [name] [prompt]` — Save and set a new personality  
-`/usepersonality [name]` — Switch to a saved personality  
-`/listpersonalities` — View all saved personalities  
-`/deletepersonality [name]` — Delete a saved personality  
+`/createpersonality [name] [prompt]` — Create a new personality (without activating)
+`/updatepersonality [name] [prompt]` — Update an existing personality
+`/usepersonality [name]` — Switch to a saved personality
+`/listpersonalities` — View all saved personalities
+`/deletepersonality [name]` — Delete a saved personality
 
 💬 **Chat + Search:**
 `/ask [prompt]` — Ask GPT-4o a question  

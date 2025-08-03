@@ -70,7 +70,8 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
 - `/web [query]` - Search the web and get AI-summarized results
 
 ### Personality Management
-- `/setpersonality [name] [prompt]` - Create and activate a new personality
+- `/createpersonality [name] [prompt]` - Create a new personality (without activating)
+- `/updatepersonality [name] [prompt]` - Update an existing personality
 - `/usepersonality [name]` - Switch to an existing personality
 - `/listpersonalities` - View all saved personalities
 - `/deletepersonality [name]` - Delete a personality
