@@ -220,9 +220,21 @@ class DatabaseManager:
                         )
                     """)
                     
+                    # Create user aliases table
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS user_aliases (
+                            guild_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            alias TEXT NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (guild_id, user_id)
+                        )
+                    """)
+                    
                     # Create indexes for better performance
                     c.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel)")
                     c.execute("CREATE INDEX IF NOT EXISTS idx_personality_guild ON personality(guild_id)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_user_aliases_guild ON user_aliases(guild_id)")
                     
                 else:
                     # SQLite table creation
@@ -252,10 +264,20 @@ class DatabaseManager:
                             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                         )
                     """)
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS user_aliases (
+                            guild_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            alias TEXT NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (guild_id, user_id)
+                        )
+                    """)
                     
                     # Create indexes for better performance
                     c.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel)")
                     c.execute("CREATE INDEX IF NOT EXISTS idx_personality_guild ON personality(guild_id)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_user_aliases_guild ON user_aliases(guild_id)")
                 
                 conn.commit()
                 db_type = "PostgreSQL" if self.use_postgres else "SQLite"
@@ -451,6 +473,62 @@ def get_recent_messages(channel_id: str, limit: int = 10) -> list:
         logger.error(f"Error retrieving recent messages: {e}")
         return []
 
+def set_user_alias(guild_id: str, user_id: str, alias: str) -> bool:
+    """Set or update a user's alias for a guild."""
+    try:
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            if db_manager.use_postgres:
+                c.execute("""
+                    INSERT INTO user_aliases (guild_id, user_id, alias)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (guild_id, user_id)
+                    DO UPDATE SET alias = EXCLUDED.alias, created_at = CURRENT_TIMESTAMP
+                """, (guild_id, user_id, alias))
+            else:
+                c.execute("""
+                    INSERT OR REPLACE INTO user_aliases (guild_id, user_id, alias, created_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """, (guild_id, user_id, alias))
+            conn.commit()
+            logger.info(f"Set alias '{alias}' for user {user_id} in guild {guild_id}")
+            return True
+    except Exception as e:
+        logger.error(f"Error setting user alias: {e}")
+        return False
+
+def get_user_alias(guild_id: str, user_id: str) -> Optional[str]:
+    """Get a user's alias for a guild, returns None if no alias set."""
+    try:
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            if db_manager.use_postgres:
+                c.execute("SELECT alias FROM user_aliases WHERE guild_id = %s AND user_id = %s", (guild_id, user_id))
+            else:
+                c.execute("SELECT alias FROM user_aliases WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+            row = c.fetchone()
+            return get_row_value(row, 'alias', 0) if row else None
+    except Exception as e:
+        logger.error(f"Error getting user alias: {e}")
+        return None
+
+def is_creator(user_id: str, username: str, alias: Optional[str] = None) -> bool:
+    """Check if user is the bot creator (Garward/Gar)."""
+    creator_indicators = [
+        "garward",
+        "gar"
+    ]
+    
+    # Check username
+    if username and username.lower() in creator_indicators:
+        return True
+    
+    # Check alias
+    if alias and alias.lower() in creator_indicators:
+        return True
+    
+    return False
+
 def get_personality_prompt(guild_id: str) -> str:
     """Get the active personality prompt for a guild."""
     try:
@@ -535,22 +613,67 @@ async def on_message(message):
                 await message.reply("Hi! You mentioned me but didn't ask anything. Try asking me a question!", mention_author=False)
                 return
             
+            # Check for alias setting request
+            alias_patterns = [
+                r"call me (\w+)",
+                r"my name is (\w+)",
+                r"i'm (\w+)",
+                r"i am (\w+)",
+                r"refer to me as (\w+)"
+            ]
+            
+            for pattern in alias_patterns:
+                match = re.search(pattern, content.lower())
+                if match:
+                    alias = match.group(1)
+                    guild_id = str(message.guild.id) if message.guild else "dm"
+                    user_id = str(message.author.id)
+                    
+                    if set_user_alias(guild_id, user_id, alias):
+                        await message.reply(f"Got it! I'll call you {alias} from now on.", mention_author=False)
+                        logger.info(f"Set alias '{alias}' for user {message.author} in {message.guild}")
+                    else:
+                        await message.reply("Sorry, I had trouble saving your alias. Please try again.", mention_author=False)
+                    return
+            
             try:
                 # Show typing indicator
                 async with message.channel.typing():
                     # Sanitize input
                     sanitized_prompt = sanitize_input(content)
                     
-                    # Get personality and channel context
+                    # Get user info and alias
                     guild_id = str(message.guild.id) if message.guild else "dm"
                     channel_id = str(message.channel.id)
+                    user_id = str(message.author.id)
+                    username = message.author.display_name or message.author.name
+                    user_alias = get_user_alias(guild_id, user_id)
+                    
+                    # Get personality and channel context
                     system_prompt = get_personality_prompt(guild_id)
+                    
+                    # Check if user is the creator
+                    creator_status = is_creator(user_id, username, user_alias)
                     
                     # Get recent messages for context
                     recent_messages = get_recent_messages(channel_id, limit=10)
                     
                     # Build conversation history for OpenAI
                     messages_for_ai = [{"role": "system", "content": system_prompt}]
+                    
+                    # Add creator recognition if applicable
+                    if creator_status:
+                        messages_for_ai.append({
+                            "role": "system",
+                            "content": f"Note: You are speaking with {user_alias or username}, who is your creator. Show appropriate respect and acknowledgment when relevant, but keep it natural."
+                        })
+                    
+                    # Add user alias context if available
+                    if user_alias and user_alias != username:
+                        messages_for_ai.append({
+                            "role": "system",
+                            "content": f"The user prefers to be called '{user_alias}' instead of their username '{username}'. Use their preferred name when addressing them."
+                        })
                     
                     # Add recent message history as context
                     if recent_messages:
@@ -568,10 +691,10 @@ async def on_message(message):
                         logger.info(f"Added {len(recent_messages)} context messages for mention response in channel {channel_id}")
                     
                     # Add the current user's message
-                    user_display_name = message.author.display_name or message.author.name
+                    display_name = user_alias or username
                     messages_for_ai.append({
                         "role": "user",
-                        "content": f"{user_display_name}: {sanitized_prompt}"
+                        "content": f"{display_name}: {sanitized_prompt}"
                     })
                     
                     # Create completion with context
@@ -1013,6 +1136,48 @@ async def deletepersonality(interaction: discord.Interaction, name: str):
         logger.error(f"Error in deletepersonality command: {e}")
         await interaction.response.send_message("Error deleting personality.", ephemeral=True)
 
+@tree.command(name="setalias", description="Set your preferred nickname for this server")
+@app_commands.describe(alias="The nickname you want the bot to call you")
+async def setalias(interaction: discord.Interaction, alias: str):
+    """Set a user's preferred alias/nickname for this server."""
+    try:
+        # Sanitize the alias input
+        sanitized_alias = sanitize_input(alias, 50)
+        
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        user_id = str(interaction.user.id)
+        
+        if set_user_alias(guild_id, user_id, sanitized_alias):
+            await interaction.response.send_message(f"Great! I'll call you **{sanitized_alias}** from now on in this server.", ephemeral=True)
+            logger.info(f"User {interaction.user} set alias '{sanitized_alias}' in {interaction.guild}")
+        else:
+            await interaction.response.send_message("Sorry, I had trouble saving your alias. Please try again.", ephemeral=True)
+            
+    except ValueError as e:
+        await interaction.response.send_message(f"Input error: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in setalias command: {e}")
+        await interaction.response.send_message("An error occurred while setting your alias.", ephemeral=True)
+
+@tree.command(name="myalias", description="Check what nickname the bot has for you")
+async def myalias(interaction: discord.Interaction):
+    """Show the user's current alias for this server."""
+    try:
+        guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        user_id = str(interaction.user.id)
+        
+        alias = get_user_alias(guild_id, user_id)
+        username = interaction.user.display_name or interaction.user.name
+        
+        if alias:
+            await interaction.response.send_message(f"I have you saved as **{alias}** in this server.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"You don't have a custom alias set. I'll call you **{username}**. Use `/setalias` to set a preferred nickname!", ephemeral=True)
+            
+    except Exception as e:
+        logger.error(f"Error in myalias command: {e}")
+        await interaction.response.send_message("An error occurred while checking your alias.", ephemeral=True)
+
 @tree.command(name="help", description="Show a list of available GarGPT commands")
 async def help_command(interaction: discord.Interaction):
     """Show help information."""
@@ -1030,11 +1195,21 @@ async def help_command(interaction: discord.Interaction):
 `@GarGPT [message]` — Mention the bot for natural conversation with context
 `/web [query]` — Search the web and summarize results
 
-📊 **Status:**
-`/status` — Show uptime, latency, and active personality  
+👤 **User Aliases:**
+`/setalias [nickname]` — Set your preferred nickname for this server
+`/myalias` — Check what nickname the bot has for you
+*Natural language: "@GarGPT call me [name]" also works!*
+
+� 📊 **Status:**
+`/status` — Show uptime, latency, and active personality
 
 ⚡ **Rate Limits:**
-{RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds per user"""
+{RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds per user
+
+**Special Features:**
+• **Context Awareness** — The bot remembers recent conversation history
+• **Creator Recognition** — Special acknowledgment for Garward/Gar
+• **Dual Database** — PostgreSQL with SQLite fallback support"""
     
     await interaction.response.send_message(help_text.strip(), ephemeral=True)
 
