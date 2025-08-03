@@ -9,6 +9,8 @@ import asyncio
 import logging
 import time
 import re
+import json
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
@@ -140,6 +142,13 @@ class RateLimiter:
 
 rate_limiter = RateLimiter()
 
+# User tracking cache to avoid database spam
+user_cache = {}
+cache_expiry = 300  # 5 minutes
+
+# Reminder task storage
+reminder_tasks = {}
+
 # Database connection management
 class DatabaseManager:
     def __init__(self, db_path: str = "message_cache.db"):
@@ -232,10 +241,45 @@ class DatabaseManager:
                         )
                     """)
                     
+                    # Create user details table for storing additional user information
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS user_details (
+                            guild_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            username TEXT,
+                            display_name TEXT,
+                            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            message_count INTEGER DEFAULT 0,
+                            preferences JSONB DEFAULT '{}',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (guild_id, user_id)
+                        )
+                    """)
+                    
+                    # Create reminders table
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS reminders (
+                            id SERIAL PRIMARY KEY,
+                            guild_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            channel_id TEXT NOT NULL,
+                            reminder_text TEXT NOT NULL,
+                            remind_at TIMESTAMP NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            completed BOOLEAN DEFAULT FALSE
+                        )
+                    """)
+                    
                     # Create indexes for better performance
                     c.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
                     c.execute("CREATE INDEX IF NOT EXISTS idx_personality_guild ON personality(guild_id)")
                     c.execute("CREATE INDEX IF NOT EXISTS idx_user_aliases_guild ON user_aliases(guild_id)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_user_details_guild ON user_details(guild_id)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_user_details_last_seen ON user_details(last_seen)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_reminders_remind_at ON reminders(remind_at)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_reminders_completed ON reminders(completed)")
                     
                 else:
                     # SQLite table creation
@@ -275,10 +319,45 @@ class DatabaseManager:
                         )
                     """)
                     
+                    # Create user details table for storing additional user information
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS user_details (
+                            guild_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            username TEXT,
+                            display_name TEXT,
+                            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            message_count INTEGER DEFAULT 0,
+                            preferences TEXT DEFAULT '{}',
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (guild_id, user_id)
+                        )
+                    """)
+                    
+                    # Create reminders table
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS reminders (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            guild_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            channel_id TEXT NOT NULL,
+                            reminder_text TEXT NOT NULL,
+                            remind_at DATETIME NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            completed INTEGER DEFAULT 0
+                        )
+                    """)
+                    
                     # Create indexes for better performance
                     c.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
                     c.execute("CREATE INDEX IF NOT EXISTS idx_personality_guild ON personality(guild_id)")
                     c.execute("CREATE INDEX IF NOT EXISTS idx_user_aliases_guild ON user_aliases(guild_id)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_user_details_guild ON user_details(guild_id)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_user_details_last_seen ON user_details(last_seen)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_reminders_remind_at ON reminders(remind_at)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_reminders_completed ON reminders(completed)")
                 
                 conn.commit()
                 db_type = "PostgreSQL" if self.use_postgres else "SQLite"
@@ -724,6 +803,195 @@ def format_user_mentions(users: List[discord.Member]) -> str:
     else:
         return f"{', '.join(mentions[:-1])}, and {mentions[-1]}"
 
+def update_user_details(guild_id: str, user_id: str, username: str, display_name: str):
+    """Update user details in database with smart caching to avoid spam."""
+    cache_key = f"{guild_id}:{user_id}"
+    current_time = time.time()
+    
+    # Check cache to avoid unnecessary database updates
+    if cache_key in user_cache:
+        last_update, cached_data = user_cache[cache_key]
+        if (current_time - last_update < cache_expiry and
+            cached_data.get('username') == username and
+            cached_data.get('display_name') == display_name):
+            return  # No update needed
+    
+    try:
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            if db_manager.use_postgres:
+                c.execute("""
+                    INSERT INTO user_details (guild_id, user_id, username, display_name, last_seen, message_count)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, 1)
+                    ON CONFLICT (guild_id, user_id)
+                    DO UPDATE SET
+                        username = EXCLUDED.username,
+                        display_name = EXCLUDED.display_name,
+                        last_seen = CURRENT_TIMESTAMP,
+                        message_count = user_details.message_count + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (guild_id, user_id, username, display_name))
+            else:
+                # First check if user exists
+                c.execute("SELECT message_count FROM user_details WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+                existing = c.fetchone()
+                
+                if existing:
+                    count = get_row_value(existing, 'message_count', 0) or 0
+                    c.execute("""
+                        UPDATE user_details SET
+                            username = ?, display_name = ?, last_seen = CURRENT_TIMESTAMP,
+                            message_count = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE guild_id = ? AND user_id = ?
+                    """, (username, display_name, count + 1, guild_id, user_id))
+                else:
+                    c.execute("""
+                        INSERT INTO user_details (guild_id, user_id, username, display_name, last_seen, message_count)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
+                    """, (guild_id, user_id, username, display_name))
+            
+            conn.commit()
+            
+            # Update cache
+            user_cache[cache_key] = (current_time, {
+                'username': username,
+                'display_name': display_name
+            })
+            
+    except Exception as e:
+        logger.error(f"Error updating user details: {e}")
+
+def parse_reminder_time(text: str) -> Optional[datetime]:
+    """Parse natural language time expressions into datetime objects."""
+    text_lower = text.lower()
+    now = datetime.now()
+    
+    # Pattern for "in X minutes/hours/days"
+    time_patterns = [
+        (r'in (\d+) minutes?', lambda m: now + timedelta(minutes=int(m.group(1)))),
+        (r'in (\d+) mins?', lambda m: now + timedelta(minutes=int(m.group(1)))),
+        (r'in (\d+) hours?', lambda m: now + timedelta(hours=int(m.group(1)))),
+        (r'in (\d+) days?', lambda m: now + timedelta(days=int(m.group(1)))),
+        (r'in (\d+)m', lambda m: now + timedelta(minutes=int(m.group(1)))),
+        (r'in (\d+)h', lambda m: now + timedelta(hours=int(m.group(1)))),
+        (r'in (\d+)d', lambda m: now + timedelta(days=int(m.group(1)))),
+        # Pattern for "in X minutes and Y seconds"
+        (r'in (\d+) minutes? and (\d+) seconds?', lambda m: now + timedelta(minutes=int(m.group(1)), seconds=int(m.group(2)))),
+        # Pattern for "in X hours and Y minutes"
+        (r'in (\d+) hours? and (\d+) minutes?', lambda m: now + timedelta(hours=int(m.group(1)), minutes=int(m.group(2)))),
+    ]
+    
+    for pattern, time_func in time_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            try:
+                return time_func(match)
+            except (ValueError, OverflowError):
+                continue
+    
+    return None
+
+def create_reminder(guild_id: str, user_id: str, channel_id: str, reminder_text: str, remind_at: datetime) -> Optional[int]:
+    """Create a reminder in the database."""
+    try:
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            if db_manager.use_postgres:
+                c.execute("""
+                    INSERT INTO reminders (guild_id, user_id, channel_id, reminder_text, remind_at)
+                    VALUES (%s, %s, %s, %s, %s) RETURNING id
+                """, (guild_id, user_id, channel_id, reminder_text, remind_at))
+                result = c.fetchone()
+                reminder_id = get_row_value(result, 'id', 0)
+            else:
+                c.execute("""
+                    INSERT INTO reminders (guild_id, user_id, channel_id, reminder_text, remind_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (guild_id, user_id, channel_id, reminder_text, remind_at))
+                reminder_id = c.lastrowid
+            
+            conn.commit()
+            logger.info(f"Created reminder {reminder_id} for user {user_id} at {remind_at}")
+            return reminder_id
+            
+    except Exception as e:
+        logger.error(f"Error creating reminder: {e}")
+        return None
+
+async def send_reminder(reminder_id: int, guild_id: str, user_id: str, channel_id: str, reminder_text: str):
+    """Send a reminder message and mark it as completed."""
+    try:
+        channel = bot.get_channel(int(channel_id))
+        if channel:
+            user_mention = f"<@{user_id}>"
+            await channel.send(f"⏰ **Reminder for {user_mention}:** {reminder_text}")
+            
+            # Mark reminder as completed
+            with db_manager.get_connection() as conn:
+                c = conn.cursor()
+                if db_manager.use_postgres:
+                    c.execute("UPDATE reminders SET completed = TRUE WHERE id = %s", (reminder_id,))
+                else:
+                    c.execute("UPDATE reminders SET completed = 1 WHERE id = ?", (reminder_id,))
+                conn.commit()
+            
+            logger.info(f"Sent reminder {reminder_id} to user {user_id}")
+        else:
+            logger.warning(f"Could not find channel {channel_id} for reminder {reminder_id}")
+            
+    except Exception as e:
+        logger.error(f"Error sending reminder {reminder_id}: {e}")
+    finally:
+        # Remove from active tasks
+        if reminder_id in reminder_tasks:
+            del reminder_tasks[reminder_id]
+
+async def schedule_reminder(reminder_id: int, guild_id: str, user_id: str, channel_id: str, reminder_text: str, remind_at: datetime):
+    """Schedule a reminder to be sent at the specified time."""
+    delay = (remind_at - datetime.now()).total_seconds()
+    
+    if delay <= 0:
+        # Send immediately if time has passed
+        await send_reminder(reminder_id, guild_id, user_id, channel_id, reminder_text)
+        return
+    
+    # Create async task
+    async def reminder_task():
+        await asyncio.sleep(delay)
+        await send_reminder(reminder_id, guild_id, user_id, channel_id, reminder_text)
+    
+    task = asyncio.create_task(reminder_task())
+    reminder_tasks[reminder_id] = task
+    logger.info(f"Scheduled reminder {reminder_id} to fire in {delay:.1f} seconds")
+
+def detect_reminder_request(content: str) -> Optional[Tuple[str, datetime]]:
+    """Detect reminder requests in natural language."""
+    reminder_patterns = [
+        r'remind me (?:to )?(.+?) (in \d+.+?)(?:\.|!|$)',
+        r'remind me (in \d+.+?) (?:to )?(.+?)(?:\.|!|$)',
+        r'set (?:a )?reminder (?:to )?(.+?) (in \d+.+?)(?:\.|!|$)',
+        r'set (?:a )?reminder (in \d+.+?) (?:to )?(.+?)(?:\.|!|$)',
+    ]
+    
+    content_lower = content.lower()
+    
+    for pattern in reminder_patterns:
+        match = re.search(pattern, content_lower)
+        if match:
+            # Determine which group is the reminder text and which is the time
+            group1, group2 = match.groups()
+            
+            if group1.startswith('in '):
+                time_text, reminder_text = group1, group2
+            else:
+                reminder_text, time_text = group1, group2
+            
+            remind_at = parse_reminder_time(time_text)
+            if remind_at:
+                return reminder_text.strip(), remind_at
+    
+    return None
+
 def get_personality_prompt(guild_id: str) -> str:
     """Get the active personality prompt for a guild."""
     try:
@@ -769,16 +1037,24 @@ async def on_message(message):
         return
     
     try:
-        # Cache the message
+        # Cache the message with enhanced timestamp handling
+        timestamp = message.created_at.isoformat()
         with db_manager.get_connection() as conn:
             c = conn.cursor()
             if db_manager.use_postgres:
                 c.execute("INSERT INTO messages (channel, author, content, timestamp) VALUES (%s, %s, %s, %s)",
-                         (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
+                         (str(message.channel.id), str(message.author), message.content, timestamp))
             else:
                 c.execute("INSERT INTO messages (channel, author, content, timestamp) VALUES (?, ?, ?, ?)",
-                         (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
+                         (str(message.channel.id), str(message.author), message.content, timestamp))
             conn.commit()
+        
+        # Update user details with smart caching
+        guild_id = str(message.guild.id) if message.guild else "dm"
+        user_id = str(message.author.id)
+        username = message.author.name
+        display_name = message.author.display_name or message.author.name
+        update_user_details(guild_id, user_id, username, display_name)
         
         # Check if bot is mentioned
         if bot.user.mentioned_in(message) and not message.mention_everyone:
@@ -806,6 +1082,34 @@ async def on_message(message):
             
             if not content:
                 await message.reply("Hi! You mentioned me but didn't ask anything. Try asking me a question!", mention_author=False)
+                return
+            
+            # Check for reminder requests first
+            reminder_request = detect_reminder_request(content)
+            if reminder_request:
+                reminder_text, remind_at = reminder_request
+                guild_id = str(message.guild.id) if message.guild else "dm"
+                user_id = str(message.author.id)
+                channel_id = str(message.channel.id)
+                
+                reminder_id = create_reminder(guild_id, user_id, channel_id, reminder_text, remind_at)
+                if reminder_id:
+                    # Schedule the reminder
+                    await schedule_reminder(reminder_id, guild_id, user_id, channel_id, reminder_text, remind_at)
+                    
+                    # Calculate time until reminder
+                    time_diff = remind_at - datetime.now()
+                    if time_diff.days > 0:
+                        time_str = f"{time_diff.days} day(s) and {time_diff.seconds // 3600} hour(s)"
+                    elif time_diff.seconds >= 3600:
+                        time_str = f"{time_diff.seconds // 3600} hour(s) and {(time_diff.seconds % 3600) // 60} minute(s)"
+                    else:
+                        time_str = f"{time_diff.seconds // 60} minute(s)"
+                    
+                    await message.reply(f"⏰ I'll remind you about '{reminder_text}' in {time_str}!", mention_author=False)
+                    logger.info(f"Set reminder for user {message.author}: '{reminder_text}' at {remind_at}")
+                else:
+                    await message.reply("Sorry, I had trouble setting your reminder. Please try again.", mention_author=False)
                 return
             
             # Check for alias setting request - improved patterns to capture full phrases
@@ -1449,6 +1753,10 @@ async def help_command(interaction: discord.Interaction):
 Use keywords like "ping", "poke", "notify", "nudge" with usernames
 *Example: "@GarGPT ping john about the meeting" or "/ask notify alice"*
 *The bot will find users by name, nickname, or alias and mention them!*
+⏰ **Reminders:**
+Natural language reminder setting with smart time parsing
+*Example: "@GarGPT remind me to check emails in 30 minutes"*
+*Supports: minutes, hours, days - "in 5 mins", "in 2 hours", "in 1 day"*
 
 � 📊 **Status:**
 `/status` — Show uptime, latency, and active personality
@@ -1459,6 +1767,8 @@ Use keywords like "ping", "poke", "notify", "nudge" with usernames
 **Special Features:**
 • **Context Awareness** — The bot remembers recent conversation history
 • **Smart User Matching** — Fuzzy matching for usernames and aliases
+• **User Tracking** — Remembers user details and activity with smart caching
+• **Timer Reminders** — Async reminder system with natural language parsing
 • **Creator Recognition** — Special acknowledgment for Garward/Gar
 • **Dual Database** — PostgreSQL with SQLite fallback support"""
     
