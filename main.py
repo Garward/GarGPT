@@ -301,6 +301,21 @@ class DatabaseManager:
 
 db_manager = DatabaseManager()
 
+# Helper function for database row access
+def get_row_value(row, column_name: str, index: int = 0):
+    """Get value from database row, handling both PostgreSQL and SQLite."""
+    if row is None:
+        return None
+    try:
+        # Try dictionary access first (works for both PostgreSQL RealDictCursor and SQLite Row)
+        return row[column_name]
+    except (KeyError, TypeError):
+        # Fallback to index access
+        try:
+            return row[index]
+        except (IndexError, TypeError):
+            return None
+
 # Response chunking utility
 async def send_chunked_response(interaction: discord.Interaction, content: str, ephemeral: bool = False):
     """Send response in chunks if it exceeds Discord's character limit."""
@@ -393,7 +408,7 @@ def get_personality_prompt(guild_id: str) -> str:
             else:
                 c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             row = c.fetchone()
-            active_name = row[0] if row else None
+            active_name = get_row_value(row, 'active_name', 0)
             
             if not active_name:
                 return "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
@@ -404,7 +419,8 @@ def get_personality_prompt(guild_id: str) -> str:
             else:
                 c.execute("SELECT system_prompt FROM personality WHERE guild_id = ? AND name = ?", (guild_id, active_name))
             row = c.fetchone()
-            return row[0] if row else "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
+            system_prompt = get_row_value(row, 'system_prompt', 0)
+            return system_prompt if system_prompt else "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
     except Exception as e:
         logger.error(f"Error getting personality prompt: {e}")
         return "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
@@ -569,7 +585,7 @@ async def status(interaction: discord.Interaction):
             else:
                 c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             row = c.fetchone()
-            personality = row[0] if row else "default"
+            personality = get_row_value(row, 'active_name', 0) or "default"
         
         latency_ms = round(bot.latency * 1000)
         
@@ -745,12 +761,16 @@ async def listpersonalities(interaction: discord.Interaction):
             else:
                 c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             active_row = c.fetchone()
-            active_name = active_row[0] if active_row else None
+            active_name = get_row_value(active_row, 'active_name', 0)
         
         personality_list = "**Saved Personalities:**\n\n"
         for row in personalities:
-            name, prompt = row[0], row[1]
+            name = get_row_value(row, 'name', 0)
+            prompt = get_row_value(row, 'system_prompt', 1)
             status = " ✅ (Active)" if name == active_name else ""
+            # Handle None values safely
+            name = name or "Unknown"
+            prompt = prompt or "No description available"
             personality_list += f"**{name}**{status}\n{prompt[:100]}{'...' if len(prompt) > 100 else ''}\n\n"
         
         await send_chunked_response(interaction, personality_list, ephemeral=True)
@@ -780,7 +800,8 @@ async def deletepersonality(interaction: discord.Interaction, name: str):
                 c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             row = c.fetchone()
             
-            if row and row[0] == sanitized_name:
+            active_name_to_delete = get_row_value(row, 'active_name', 0)
+            if row and active_name_to_delete == sanitized_name:
                 if db_manager.use_postgres:
                     c.execute("DELETE FROM personality_active WHERE guild_id = %s", (guild_id,))
                 else:
