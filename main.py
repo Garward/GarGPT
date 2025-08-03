@@ -397,6 +397,60 @@ def is_allowed(interaction: discord.Interaction) -> bool:
     role_names = [role.name for role in interaction.user.roles]
     return any(allowed in role_names for allowed in ALLOWED_ROLES)
 
+def get_recent_messages(channel_id: str, limit: int = 10) -> list:
+    """Get recent messages from a channel for context awareness."""
+    try:
+        with db_manager.get_connection() as conn:
+            c = conn.cursor()
+            
+            # Query recent messages, excluding bot messages to avoid confusion
+            if db_manager.use_postgres:
+                c.execute("""
+                    SELECT author, content, timestamp
+                    FROM messages
+                    WHERE channel = %s
+                    ORDER BY timestamp DESC
+                    LIMIT %s
+                """, (channel_id, limit))
+            else:
+                c.execute("""
+                    SELECT author, content, timestamp
+                    FROM messages
+                    WHERE channel = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (channel_id, limit))
+            
+            messages = c.fetchall()
+            
+            # Reverse to get chronological order (oldest first)
+            messages.reverse()
+            
+            # Format messages for context
+            formatted_messages = []
+            for msg in messages:
+                author = get_row_value(msg, 'author', 0)
+                content = get_row_value(msg, 'content', 1)
+                
+                # Skip empty messages or bot's own messages
+                if not content or not author or bot_name in str(author):
+                    continue
+                
+                # Clean up author name (remove discriminator and ID if present)
+                clean_author = str(author).split('#')[0].split('<')[0].strip()
+                
+                formatted_messages.append({
+                    'author': clean_author,
+                    'content': content[:500]  # Limit content length for context
+                })
+            
+            logger.info(f"Retrieved {len(formatted_messages)} context messages for channel {channel_id}")
+            return formatted_messages
+            
+    except Exception as e:
+        logger.error(f"Error retrieving recent messages: {e}")
+        return []
+
 def get_personality_prompt(guild_id: str) -> str:
     """Get the active personality prompt for a guild."""
     try:
@@ -454,9 +508,9 @@ async def on_message(message):
     except Exception as e:
         logger.error(f"Error caching message: {e}")
 
-@tree.command(name="ask", description="Ask GPT-4o a question")
+@tree.command(name="ask", description="Ask GPT-4o a question with channel context")
 async def ask(interaction: discord.Interaction, prompt: str):
-    """Ask GPT-4o a question."""
+    """Ask GPT-4o a question with context from recent channel messages."""
     if not is_allowed(interaction):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
@@ -465,7 +519,7 @@ async def ask(interaction: discord.Interaction, prompt: str):
     if rate_limiter.is_rate_limited(interaction.user.id):
         reset_time = rate_limiter.get_reset_time(interaction.user.id)
         await interaction.response.send_message(
-            f"Rate limit exceeded. Please wait {reset_time} seconds before trying again.", 
+            f"Rate limit exceeded. Please wait {reset_time} seconds before trying again.",
             ephemeral=True
         )
         return
@@ -476,27 +530,54 @@ async def ask(interaction: discord.Interaction, prompt: str):
         # Sanitize input
         sanitized_prompt = sanitize_input(prompt)
         
-        # Get personality and create completion
+        # Get personality and channel context
         guild_id = str(interaction.guild.id) if interaction.guild else "dm"
+        channel_id = str(interaction.channel.id)
         system_prompt = get_personality_prompt(guild_id)
         
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": sanitized_prompt}
-        ]
+        # Get recent messages for context
+        recent_messages = get_recent_messages(channel_id, limit=10)
         
-        answer = await openai_manager.create_completion(messages, max_tokens=300)
+        # Build conversation history for OpenAI
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add recent message history as context
+        if recent_messages:
+            # Create a context summary from recent messages
+            context_summary = "Recent conversation context:\n"
+            for msg in recent_messages:
+                context_summary += f"{msg['author']}: {msg['content']}\n"
+            
+            # Add context as a system message
+            messages.append({
+                "role": "system",
+                "content": f"Here's the recent conversation context to help you respond appropriately:\n\n{context_summary}\nNow respond to the user's current question while being aware of this context."
+            })
+            
+            logger.info(f"Added {len(recent_messages)} context messages for channel {channel_id}")
+        else:
+            logger.info(f"No context messages found for channel {channel_id}")
+        
+        # Add the current user's prompt
+        user_display_name = interaction.user.display_name or interaction.user.name
+        messages.append({
+            "role": "user",
+            "content": f"{user_display_name}: {sanitized_prompt}"
+        })
+        
+        # Create completion with context
+        answer = await openai_manager.create_completion(messages, max_tokens=400)
         
         if answer:
             await send_chunked_response(interaction, answer)
-            logger.info(f"Ask command used by {interaction.user} in {interaction.guild}")
+            logger.info(f"Context-aware ask command used by {interaction.user} in {interaction.guild}")
         else:
             await interaction.followup.send("I couldn't generate a response. Please try again.")
             
     except ValueError as e:
         await interaction.followup.send(f"Input error: {str(e)}", ephemeral=True)
     except Exception as e:
-        logger.error(f"Error in ask command: {e}")
+        logger.error(f"Error in context-aware ask command: {e}")
         await interaction.followup.send("An error occurred while processing your request.", ephemeral=True)
 
 @tree.command(name="web", description="Search the web and summarize with GPT-4o")
@@ -836,8 +917,8 @@ async def help_command(interaction: discord.Interaction):
 `/deletepersonality [name]` — Delete a saved personality
 
 💬 **Chat + Search:**
-`/ask [prompt]` — Ask GPT-4o a question  
-`/web [query]` — Search the web and summarize results  
+`/ask [prompt]` — Ask GPT-4o a question with channel context awareness
+`/web [query]` — Search the web and summarize results
 
 📊 **Status:**
 `/status` — Show uptime, latency, and active personality  

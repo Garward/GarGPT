@@ -5,6 +5,7 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
 ## Features
 
 - **GPT-4o Integration**: Ask questions and get intelligent responses
+- **Context Awareness**: Bot reads recent channel messages to provide contextually relevant responses
 - **Web Search**: Search the web and get AI-summarized results using Brave Search API
 - **Personality System**: Create, manage, and switch between different AI personalities
 - **Rate Limiting**: User-level rate limiting to prevent API abuse
@@ -66,7 +67,7 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
 ## Commands
 
 ### Chat Commands
-- `/ask [prompt]` - Ask GPT-4o a question
+- `/ask [prompt]` - Ask GPT-4o a question with channel context awareness (uses last 10 messages)
 - `/web [query]` - Search the web and get AI-summarized results
 
 ### Personality Management
