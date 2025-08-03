@@ -14,6 +14,16 @@ from typing import Optional, Dict, Any
 from contextlib import contextmanager
 from discord import app_commands
 
+# Try to import PostgreSQL support
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+    psycopg2 = None
+    RealDictCursor = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +55,15 @@ def validate_environment():
             logger.error(f"  - {var}")
         raise ValueError("Required environment variables are missing. Please set them before starting the bot.")
     
+    # Check for PostgreSQL configuration
+    postgres_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+    if postgres_url and POSTGRES_AVAILABLE:
+        logger.info("PostgreSQL configuration detected and available.")
+    elif postgres_url and not POSTGRES_AVAILABLE:
+        logger.warning("PostgreSQL URL provided but psycopg2 not installed. Falling back to SQLite.")
+    else:
+        logger.info("No PostgreSQL configuration found. Using SQLite.")
+    
     logger.info("All required environment variables are set.")
 
 # Validate environment on startup
@@ -58,6 +77,10 @@ BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "2000"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+USE_POSTGRES = DATABASE_URL and POSTGRES_AVAILABLE
 
 # Input validation and sanitization
 def sanitize_input(text: str, max_length: int = MAX_PROMPT_LENGTH) -> str:
@@ -120,17 +143,40 @@ rate_limiter = RateLimiter()
 class DatabaseManager:
     def __init__(self, db_path: str = "message_cache.db"):
         self.db_path = db_path
+        self.use_postgres = USE_POSTGRES
+        self.database_url = DATABASE_URL
+        
+        if self.use_postgres:
+            logger.info("Using PostgreSQL database")
+        else:
+            logger.info("Using SQLite database")
+        
         self.init_database()
     
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections."""
+        """Context manager for database connections with PostgreSQL/SQLite fallback."""
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30.0)
-            conn.row_factory = sqlite3.Row
-            yield conn
-        except sqlite3.Error as e:
+            if self.use_postgres and POSTGRES_AVAILABLE:
+                try:
+                    conn = psycopg2.connect(self.database_url, cursor_factory=RealDictCursor)
+                    conn.autocommit = False
+                    yield conn
+                except Exception as e:
+                    logger.error(f"PostgreSQL connection failed: {e}. Falling back to SQLite.")
+                    self.use_postgres = False
+                    # Fallback to SQLite
+                    if conn:
+                        conn.close()
+                    conn = sqlite3.connect(self.db_path, timeout=30.0)
+                    conn.row_factory = sqlite3.Row
+                    yield conn
+            else:
+                conn = sqlite3.connect(self.db_path, timeout=30.0)
+                conn.row_factory = sqlite3.Row
+                yield conn
+        except Exception as e:
             logger.error(f"Database error: {e}")
             if conn:
                 conn.rollback()
@@ -140,37 +186,118 @@ class DatabaseManager:
                 conn.close()
     
     def init_database(self):
-        """Initialize database tables."""
-        with self.get_connection() as conn:
-            c = conn.cursor()
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    channel TEXT NOT NULL,
-                    author TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS personality (
-                    guild_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    system_prompt TEXT NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (guild_id, name)
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS personality_active (
-                    guild_id TEXT PRIMARY KEY,
-                    active_name TEXT NOT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.commit()
-            logger.info("Database initialized successfully")
+        """Initialize database tables for PostgreSQL or SQLite."""
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                
+                if self.use_postgres:
+                    # PostgreSQL table creation
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS messages (
+                            id SERIAL PRIMARY KEY,
+                            channel TEXT NOT NULL,
+                            author TEXT NOT NULL,
+                            content TEXT NOT NULL,
+                            timestamp TEXT NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS personality (
+                            guild_id TEXT NOT NULL,
+                            name TEXT NOT NULL,
+                            system_prompt TEXT NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (guild_id, name)
+                        )
+                    """)
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS personality_active (
+                            guild_id TEXT PRIMARY KEY,
+                            active_name TEXT NOT NULL,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Create indexes for better performance
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_personality_guild ON personality(guild_id)")
+                    
+                else:
+                    # SQLite table creation
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS messages (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            channel TEXT NOT NULL,
+                            author TEXT NOT NULL,
+                            content TEXT NOT NULL,
+                            timestamp TEXT NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS personality (
+                            guild_id TEXT NOT NULL,
+                            name TEXT NOT NULL,
+                            system_prompt TEXT NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (guild_id, name)
+                        )
+                    """)
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS personality_active (
+                            guild_id TEXT PRIMARY KEY,
+                            active_name TEXT NOT NULL,
+                            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Create indexes for better performance
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel)")
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_personality_guild ON personality(guild_id)")
+                
+                conn.commit()
+                db_type = "PostgreSQL" if self.use_postgres else "SQLite"
+                logger.info(f"{db_type} database initialized successfully")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            if self.use_postgres:
+                logger.info("Falling back to SQLite due to PostgreSQL initialization failure")
+                self.use_postgres = False
+                self.init_database()  # Retry with SQLite
+            else:
+                raise
+    
+    def execute_query(self, query: str, params: tuple = (), fetch_one: bool = False, fetch_all: bool = False):
+        """Execute a database query with automatic PostgreSQL/SQLite syntax handling."""
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                
+                # Convert PostgreSQL-style parameters to SQLite if needed
+                if not self.use_postgres and '%s' in query:
+                    # Convert %s to ? for SQLite
+                    query = query.replace('%s', '?')
+                
+                c.execute(query, params)
+                
+                if fetch_one:
+                    result = c.fetchone()
+                    return dict(result) if result else None
+                elif fetch_all:
+                    results = c.fetchall()
+                    return [dict(row) for row in results] if results else []
+                
+                conn.commit()
+                return True
+                
+        except Exception as e:
+            logger.error(f"Database query error: {e}")
+            if fetch_one or fetch_all:
+                return None if fetch_one else []
+            return False
 
 db_manager = DatabaseManager()
 
@@ -258,18 +385,26 @@ def is_allowed(interaction: discord.Interaction) -> bool:
 def get_personality_prompt(guild_id: str) -> str:
     """Get the active personality prompt for a guild."""
     try:
+        # Get active personality name
         with db_manager.get_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            if db_manager.use_postgres:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = %s", (guild_id,))
+            else:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             row = c.fetchone()
-            active_name = row['active_name'] if row else None
+            active_name = row[0] if row else None
             
             if not active_name:
                 return "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
             
-            c.execute("SELECT system_prompt FROM personality WHERE guild_id = ? AND name = ?", (guild_id, active_name))
+            # Get personality prompt
+            if db_manager.use_postgres:
+                c.execute("SELECT system_prompt FROM personality WHERE guild_id = %s AND name = %s", (guild_id, active_name))
+            else:
+                c.execute("SELECT system_prompt FROM personality WHERE guild_id = ? AND name = ?", (guild_id, active_name))
             row = c.fetchone()
-            return row['system_prompt'] if row else "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
+            return row[0] if row else "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
     except Exception as e:
         logger.error(f"Error getting personality prompt: {e}")
         return "You are GarGPT, a helpful assistant with a bit of sass and a love for the word 'Gar'."
@@ -293,8 +428,12 @@ async def on_message(message):
     try:
         with db_manager.get_connection() as conn:
             c = conn.cursor()
-            c.execute("INSERT INTO messages (channel, author, content, timestamp) VALUES (?, ?, ?, ?)",
-                     (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
+            if db_manager.use_postgres:
+                c.execute("INSERT INTO messages (channel, author, content, timestamp) VALUES (%s, %s, %s, %s)",
+                         (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
+            else:
+                c.execute("INSERT INTO messages (channel, author, content, timestamp) VALUES (?, ?, ?, ?)",
+                         (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
             conn.commit()
     except Exception as e:
         logger.error(f"Error caching message: {e}")
@@ -425,9 +564,12 @@ async def status(interaction: discord.Interaction):
         
         with db_manager.get_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            if db_manager.use_postgres:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = %s", (guild_id,))
+            else:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             row = c.fetchone()
-            personality = row['active_name'] if row else "default"
+            personality = row[0] if row else "default"
         
         latency_ms = round(bot.latency * 1000)
         
@@ -461,10 +603,16 @@ async def setpersonality(interaction: discord.Interaction, name: str, prompt: st
         
         with db_manager.get_connection() as conn:
             c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO personality VALUES (?, ?, ?)", 
-                     (guild_id, sanitized_name, sanitized_prompt))
-            c.execute("INSERT OR REPLACE INTO personality_active VALUES (?, ?)", 
-                     (guild_id, sanitized_name))
+            if db_manager.use_postgres:
+                c.execute("INSERT INTO personality (guild_id, name, system_prompt) VALUES (%s, %s, %s) ON CONFLICT (guild_id, name) DO UPDATE SET system_prompt = EXCLUDED.system_prompt, created_at = CURRENT_TIMESTAMP",
+                         (guild_id, sanitized_name, sanitized_prompt))
+                c.execute("INSERT INTO personality_active (guild_id, active_name) VALUES (%s, %s) ON CONFLICT (guild_id) DO UPDATE SET active_name = EXCLUDED.active_name, updated_at = CURRENT_TIMESTAMP",
+                         (guild_id, sanitized_name))
+            else:
+                c.execute("INSERT OR REPLACE INTO personality VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                         (guild_id, sanitized_name, sanitized_prompt))
+                c.execute("INSERT OR REPLACE INTO personality_active VALUES (?, ?, CURRENT_TIMESTAMP)",
+                         (guild_id, sanitized_name))
             conn.commit()
         
         await interaction.response.send_message(f"Set personality '{sanitized_name}' and made it active for this server.")
@@ -490,14 +638,23 @@ async def usepersonality(interaction: discord.Interaction, name: str):
         
         with db_manager.get_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT name FROM personality WHERE guild_id = ? AND name = ?", 
-                     (guild_id, sanitized_name))
+            # Check if personality exists
+            if db_manager.use_postgres:
+                c.execute("SELECT name FROM personality WHERE guild_id = %s AND name = %s", (guild_id, sanitized_name))
+            else:
+                c.execute("SELECT name FROM personality WHERE guild_id = ? AND name = ?", (guild_id, sanitized_name))
+            
             if not c.fetchone():
                 await interaction.response.send_message(f"Personality '{sanitized_name}' not found for this server.", ephemeral=True)
                 return
             
-            c.execute("INSERT OR REPLACE INTO personality_active VALUES (?, ?)", 
-                     (guild_id, sanitized_name))
+            # Set active personality
+            if db_manager.use_postgres:
+                c.execute("INSERT INTO personality_active (guild_id, active_name) VALUES (%s, %s) ON CONFLICT (guild_id) DO UPDATE SET active_name = EXCLUDED.active_name, updated_at = CURRENT_TIMESTAMP",
+                         (guild_id, sanitized_name))
+            else:
+                c.execute("INSERT OR REPLACE INTO personality_active VALUES (?, ?, CURRENT_TIMESTAMP)",
+                         (guild_id, sanitized_name))
             conn.commit()
         
         await interaction.response.send_message(f"Switched to personality '{sanitized_name}' for this server.")
@@ -517,20 +674,28 @@ async def listpersonalities(interaction: discord.Interaction):
         
         with db_manager.get_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT name, system_prompt FROM personality WHERE guild_id = ?", (guild_id,))
+            # Get all personalities
+            if db_manager.use_postgres:
+                c.execute("SELECT name, system_prompt FROM personality WHERE guild_id = %s", (guild_id,))
+            else:
+                c.execute("SELECT name, system_prompt FROM personality WHERE guild_id = ?", (guild_id,))
             personalities = c.fetchall()
             
             if not personalities:
                 await interaction.response.send_message("No personalities saved for this server.", ephemeral=True)
                 return
             
-            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            # Get active personality
+            if db_manager.use_postgres:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = %s", (guild_id,))
+            else:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             active_row = c.fetchone()
-            active_name = active_row['active_name'] if active_row else None
+            active_name = active_row[0] if active_row else None
         
         personality_list = "**Saved Personalities:**\n\n"
         for row in personalities:
-            name, prompt = row['name'], row['system_prompt']
+            name, prompt = row[0], row[1]
             status = " ✅ (Active)" if name == active_name else ""
             personality_list += f"**{name}**{status}\n{prompt[:100]}{'...' if len(prompt) > 100 else ''}\n\n"
         
@@ -554,12 +719,24 @@ async def deletepersonality(interaction: discord.Interaction, name: str):
         
         with db_manager.get_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
+            # Check if deleting active personality
+            if db_manager.use_postgres:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = %s", (guild_id,))
+            else:
+                c.execute("SELECT active_name FROM personality_active WHERE guild_id = ?", (guild_id,))
             row = c.fetchone()
-            if row and row['active_name'] == sanitized_name:
-                c.execute("DELETE FROM personality_active WHERE guild_id = ?", (guild_id,))
             
-            c.execute("DELETE FROM personality WHERE guild_id = ? AND name = ?", (guild_id, sanitized_name))
+            if row and row[0] == sanitized_name:
+                if db_manager.use_postgres:
+                    c.execute("DELETE FROM personality_active WHERE guild_id = %s", (guild_id,))
+                else:
+                    c.execute("DELETE FROM personality_active WHERE guild_id = ?", (guild_id,))
+            
+            # Delete personality
+            if db_manager.use_postgres:
+                c.execute("DELETE FROM personality WHERE guild_id = %s AND name = %s", (guild_id, sanitized_name))
+            else:
+                c.execute("DELETE FROM personality WHERE guild_id = ? AND name = ?", (guild_id, sanitized_name))
             conn.commit()
         
         await interaction.response.send_message(f"Deleted personality '{sanitized_name}' for this server.")

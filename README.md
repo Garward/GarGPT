@@ -37,6 +37,11 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
    export OPENAI_API_KEY="your_openai_api_key"
    export BRAVE_API_KEY="your_brave_search_api_key"
    export ALLOWED_ROLES="Admin,Moderator"  # Optional: comma-separated role names
+   
+   # Optional: PostgreSQL database (will fallback to SQLite if not provided)
+   export DATABASE_URL="postgresql://username:password@host:port/database"
+   # OR
+   export POSTGRES_URL="postgresql://username:password@host:port/database"
    ```
 
 4. Run the bot:
@@ -51,6 +56,8 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
 | `DISCORD_BOT_TOKEN` | Yes | Discord bot token | - |
 | `OPENAI_API_KEY` | Yes | OpenAI API key for GPT-4o | - |
 | `BRAVE_API_KEY` | Yes | Brave Search API key | - |
+| `DATABASE_URL` | No | PostgreSQL connection string | SQLite fallback |
+| `POSTGRES_URL` | No | Alternative PostgreSQL connection string | SQLite fallback |
 | `ALLOWED_ROLES` | No | Comma-separated list of allowed Discord roles | All users allowed |
 | `MAX_PROMPT_LENGTH` | No | Maximum length for user prompts | 2000 |
 | `RATE_LIMIT_REQUESTS` | No | Number of requests per time window | 10 |
@@ -93,10 +100,24 @@ Log levels include:
 
 ## Database
 
-The bot uses SQLite for local data storage:
+The bot supports both PostgreSQL and SQLite databases:
+
+### PostgreSQL (Recommended for Production)
+- Set `DATABASE_URL` or `POSTGRES_URL` environment variable
+- Automatic failover to SQLite if PostgreSQL is unavailable
+- Better performance and concurrent access
+- Suitable for Railway, Heroku, and other cloud platforms
+
+### SQLite (Local Development)
+- Used automatically if no PostgreSQL URL is provided
 - `message_cache.db` - Stores message cache and personality data
+- Good for local development and testing
+
+### Features
 - Automatic table creation and migration
 - Connection pooling for reliability
+- Graceful fallback from PostgreSQL to SQLite
+- Database-agnostic query handling
 
 ## Error Handling
 
