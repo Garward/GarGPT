@@ -136,6 +136,20 @@ async def deletepersonality(interaction: discord.Interaction, name: str):
     conn.commit()
     await interaction.response.send_message(f"Deleted personality '{name}' for this server.")
 
+@tree.command(name="help", description="Show a list of available commands")
+async def help_command(interaction: discord.Interaction):
+    help_text = """
+**GarGPT Slash Commands**
+
+/ask [prompt] — Ask GPT-4o a question  
+/web [query] — Search the web and summarize results  
+/status — Show uptime, latency, and active personality  
+/deletepersonality [name] — Delete a saved personality  
+
+(More coming soon: personality management, summaries, search, etc.)
+"""
+    await interaction.response.send_message(help_text.strip())
+
 import time
 bot.start_time = time.time()
 
