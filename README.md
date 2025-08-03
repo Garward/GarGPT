@@ -6,6 +6,7 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
 
 - **GPT-4o Integration**: Ask questions and get intelligent responses
 - **Context Awareness**: Bot reads recent channel messages to provide contextually relevant responses
+- **Natural Conversation**: Mention the bot (@GarGPT) for natural back-and-forth conversations
 - **Web Search**: Search the web and get AI-summarized results using Brave Search API
 - **Personality System**: Create, manage, and switch between different AI personalities
 - **Rate Limiting**: User-level rate limiting to prevent API abuse
@@ -14,7 +15,7 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
 - **Input Validation**: Sanitizes and validates all user inputs for security
 - **Logging**: Detailed logging for debugging and monitoring
 - **Database Management**: Proper connection pooling and error handling
-
+- **PostgreSQL Support**: Uses PostgreSQL for production, with SQLite fallback for local development
 ## Setup
 
 ### Prerequisites
@@ -68,6 +69,7 @@ A production-ready Discord bot that integrates GPT-4o with web search capabiliti
 
 ### Chat Commands
 - `/ask [prompt]` - Ask GPT-4o a question with channel context awareness (uses last 10 messages)
+- `@GarGPT [message]` - Mention the bot for natural conversation with context awareness
 - `/web [query]` - Search the web and get AI-summarized results
 
 ### Personality Management

@@ -491,11 +491,12 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    """Message event handler for caching."""
+    """Message event handler for caching and mention responses."""
     if message.author.bot:
         return
     
     try:
+        # Cache the message
         with db_manager.get_connection() as conn:
             c = conn.cursor()
             if db_manager.use_postgres:
@@ -505,8 +506,116 @@ async def on_message(message):
                 c.execute("INSERT INTO messages (channel, author, content, timestamp) VALUES (?, ?, ?, ?)",
                          (str(message.channel.id), str(message.author), message.content, str(message.created_at)))
             conn.commit()
+        
+        # Check if bot is mentioned
+        if bot.user.mentioned_in(message) and not message.mention_everyone:
+            # Check permissions
+            if message.guild and ALLOWED_ROLES:
+                role_names = [role.name for role in message.author.roles]
+                if not any(allowed in role_names for allowed in ALLOWED_ROLES):
+                    await message.reply("You don't have permission to use this bot.", mention_author=False)
+                    return
+            
+            # Rate limiting check
+            if rate_limiter.is_rate_limited(message.author.id):
+                reset_time = rate_limiter.get_reset_time(message.author.id)
+                await message.reply(f"Rate limit exceeded. Please wait {reset_time} seconds before trying again.", mention_author=False)
+                return
+            
+            # Extract the message content without the mention
+            content = message.content
+            # Remove bot mentions from the content
+            for mention in message.mentions:
+                if mention == bot.user:
+                    content = content.replace(f'<@{mention.id}>', '').replace(f'<@!{mention.id}>', '')
+            
+            content = content.strip()
+            
+            if not content:
+                await message.reply("Hi! You mentioned me but didn't ask anything. Try asking me a question!", mention_author=False)
+                return
+            
+            try:
+                # Show typing indicator
+                async with message.channel.typing():
+                    # Sanitize input
+                    sanitized_prompt = sanitize_input(content)
+                    
+                    # Get personality and channel context
+                    guild_id = str(message.guild.id) if message.guild else "dm"
+                    channel_id = str(message.channel.id)
+                    system_prompt = get_personality_prompt(guild_id)
+                    
+                    # Get recent messages for context
+                    recent_messages = get_recent_messages(channel_id, limit=10)
+                    
+                    # Build conversation history for OpenAI
+                    messages_for_ai = [{"role": "system", "content": system_prompt}]
+                    
+                    # Add recent message history as context
+                    if recent_messages:
+                        # Create a context summary from recent messages
+                        context_summary = "Recent conversation context:\n"
+                        for msg in recent_messages:
+                            context_summary += f"{msg['author']}: {msg['content']}\n"
+                        
+                        # Add context as a system message
+                        messages_for_ai.append({
+                            "role": "system",
+                            "content": f"Here's the recent conversation context to help you respond appropriately:\n\n{context_summary}\nNow respond to the user's current message while being aware of this context."
+                        })
+                        
+                        logger.info(f"Added {len(recent_messages)} context messages for mention response in channel {channel_id}")
+                    
+                    # Add the current user's message
+                    user_display_name = message.author.display_name or message.author.name
+                    messages_for_ai.append({
+                        "role": "user",
+                        "content": f"{user_display_name}: {sanitized_prompt}"
+                    })
+                    
+                    # Create completion with context
+                    answer = await openai_manager.create_completion(messages_for_ai, max_tokens=400)
+                    
+                    if answer:
+                        # Split response if too long for Discord
+                        if len(answer) <= 2000:
+                            await message.reply(answer, mention_author=False)
+                        else:
+                            # Send in chunks
+                            chunks = []
+                            current_chunk = ""
+                            
+                            for line in answer.split('\n'):
+                                if len(current_chunk) + len(line) + 1 <= 2000:
+                                    current_chunk += line + '\n'
+                                else:
+                                    if current_chunk:
+                                        chunks.append(current_chunk.strip())
+                                    current_chunk = line + '\n'
+                            
+                            if current_chunk:
+                                chunks.append(current_chunk.strip())
+                            
+                            # Send first chunk as reply
+                            await message.reply(chunks[0], mention_author=False)
+                            
+                            # Send remaining chunks as regular messages
+                            for chunk in chunks[1:]:
+                                await message.channel.send(chunk)
+                        
+                        logger.info(f"Mention response sent to {message.author} in {message.guild}")
+                    else:
+                        await message.reply("I couldn't generate a response. Please try again.", mention_author=False)
+                        
+            except ValueError as e:
+                await message.reply(f"Input error: {str(e)}", mention_author=False)
+            except Exception as e:
+                logger.error(f"Error in mention response: {e}")
+                await message.reply("An error occurred while processing your message.", mention_author=False)
+    
     except Exception as e:
-        logger.error(f"Error caching message: {e}")
+        logger.error(f"Error in message handler: {e}")
 
 @tree.command(name="ask", description="Ask GPT-4o a question with channel context")
 async def ask(interaction: discord.Interaction, prompt: str):
@@ -918,6 +1027,7 @@ async def help_command(interaction: discord.Interaction):
 
 💬 **Chat + Search:**
 `/ask [prompt]` — Ask GPT-4o a question with channel context awareness
+`@GarGPT [message]` — Mention the bot for natural conversation with context
 `/web [query]` — Search the web and summarize results
 
 📊 **Status:**
