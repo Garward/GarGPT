@@ -566,10 +566,20 @@ def set_user_alias(guild_id: str, user_id: str, alias: str) -> bool:
                     DO UPDATE SET alias = EXCLUDED.alias, created_at = CURRENT_TIMESTAMP
                 """, (guild_id, user_id, alias))
             else:
+                # For SQLite, first try to update, then insert if no rows affected
                 c.execute("""
-                    INSERT OR REPLACE INTO user_aliases (guild_id, user_id, alias, created_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                """, (guild_id, user_id, alias))
+                    UPDATE user_aliases
+                    SET alias = ?, created_at = CURRENT_TIMESTAMP
+                    WHERE guild_id = ? AND user_id = ?
+                """, (alias, guild_id, user_id))
+                
+                if c.rowcount == 0:
+                    # No existing record, insert new one
+                    c.execute("""
+                        INSERT INTO user_aliases (guild_id, user_id, alias, created_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (guild_id, user_id, alias))
+            
             conn.commit()
             logger.info(f"Set alias '{alias}' for user {user_id} in guild {guild_id}")
             return True
@@ -1122,22 +1132,26 @@ async def on_message(message):
             ]
             
             for pattern in alias_patterns:
+                # Search in lowercase but extract from original content to preserve case
                 match = re.search(pattern, content.lower())
                 if match:
-                    alias = match.group(1).strip()
-                    # Skip if alias is too short or contains common words that aren't names
-                    if len(alias) < 2 or alias.lower() in ['called', 'what', 'am', 'is', 'are', 'the', 'a', 'an']:
-                        continue
-                    
-                    guild_id = str(message.guild.id) if message.guild else "dm"
-                    user_id = str(message.author.id)
-                    
-                    if set_user_alias(guild_id, user_id, alias):
-                        await message.reply(f"Got it! I'll call you {alias} from now on.", mention_author=False)
-                        logger.info(f"Set alias '{alias}' for user {message.author} in {message.guild}")
-                    else:
-                        await message.reply("Sorry, I had trouble saving your alias. Please try again.", mention_author=False)
-                    return
+                    # Find the same match in the original content to preserve capitalization
+                    original_match = re.search(pattern, content, re.IGNORECASE)
+                    if original_match:
+                        alias = original_match.group(1).strip()
+                        # Skip if alias is too short or contains common words that aren't names
+                        if len(alias) < 2 or alias.lower() in ['called', 'what', 'am', 'is', 'are', 'the', 'a', 'an']:
+                            continue
+                        
+                        guild_id = str(message.guild.id) if message.guild else "dm"
+                        user_id = str(message.author.id)
+                        
+                        if set_user_alias(guild_id, user_id, alias):
+                            await message.reply(f"Got it! I'll call you {alias} from now on.", mention_author=False)
+                            logger.info(f"Set alias '{alias}' for user {message.author} in {message.guild}")
+                        else:
+                            await message.reply("Sorry, I had trouble saving your alias. Please try again.", mention_author=False)
+                        return
             
             try:
                 # Show typing indicator
