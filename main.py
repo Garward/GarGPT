@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-import openai
+import openai import OpenAI
 import sqlite3
 import os
 import requests
@@ -66,7 +66,9 @@ async def ask(interaction: discord.Interaction, prompt: str):
         return
     await interaction.response.defer()
     system_prompt = get_personality_prompt(interaction.guild.id if interaction.guild else "dm")
-    response = openai.ChatCompletion.create(
+    from openai import OpenAI
+    client = OpenAI()
+    response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -74,7 +76,8 @@ async def ask(interaction: discord.Interaction, prompt: str):
         ],
         max_tokens=300
     )
-    await interaction.followup.send(response.choices[0].message.content[:2000])
+    answer = response.choices[0].message.content
+    await interaction.followup.send(answer[:2000])
 
 @tree.command(name="web", description="Search the web and summarize with GPT-4o")
 async def web(interaction: discord.Interaction, query: str):
@@ -92,14 +95,26 @@ async def web(interaction: discord.Interaction, query: str):
     if not results:
         await interaction.followup.send("No web results found.")
         return
-    snippets = "\n\n".join([f"Title: {r['title']}\nURL: {r['url']}\nSnippet: {r['description']}" for r in results])
+    snippets = "
+
+".join([f"Title: {r['title']}
+URL: {r['url']}
+Snippet: {r['description']}" for r in results])
     system_prompt = get_personality_prompt(interaction.guild.id if interaction.guild else "dm")
-    summary = openai.ChatCompletion.create(
+    from openai import OpenAI
+    client = OpenAI()
+    summary = client.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Summarize these search results and answer the query: {query}\n\n{snippets}"}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Summarize these search results and answer the query: {query}
+
+{snippets}"}
+        ],
         max_tokens=400
     )
-    await interaction.followup.send(summary.choices[0].message.content[:2000])
+    answer = summary.choices[0].message.content
+    await interaction.followup.send(answer[:2000])
 
 @tree.command(name="status", description="Show current bot status and runtime info")
 async def status(interaction: discord.Interaction):
