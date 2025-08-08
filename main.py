@@ -465,7 +465,7 @@ class OpenAIManager:
             response = self.client.chat.completions.create(
                 model="gpt-5-mini",
                 messages=messages,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
                 temperature=0.7
             )
             return response.choices[0].message.content
