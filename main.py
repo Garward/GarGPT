@@ -459,16 +459,16 @@ class OpenAIManager:
     def __init__(self):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
     
-    async def create_completion(self, messages: list, max_completion_tokens: int = 1000) -> Optional[str]:
+    async def create_completion(self, messages: list, max_output_tokens: int = 1000) -> Optional[str]:
         """Create OpenAI completion with error handling."""
         try:
-            logger.debug(f"Making OpenAI API call with model: gpt-5-mini, max_completion_tokens: {max_completion_tokens}")
+            logger.debug(f"Making OpenAI API call with model: gpt-5-mini, max_output_tokens: {max_output_tokens}")
             logger.debug(f"Messages count: {len(messages)}")
             
             response = self.client.chat.completions.create(
                 model="gpt-5-mini",
                 messages=messages,
-                max_completion_tokens=max_completion_tokens
+                max_output_tokens=max_output_tokens
             )
             
             logger.debug(f"OpenAI API response received successfully")
@@ -1253,7 +1253,7 @@ async def on_message(message):
                     })
                     
                     # Create completion with context
-                    answer = await openai_manager.create_completion(messages_for_ai, max_completion_tokens=1000)
+                    answer = await openai_manager.create_completion(messages_for_ai, max_output_tokens=400)
                     
                     if answer:
                         # Add user mentions to the response if detected
@@ -1376,7 +1376,7 @@ async def ask(interaction: discord.Interaction, prompt: str):
         })
         
         # Create completion with context
-        answer = await openai_manager.create_completion(messages, max_completion_tokens=1000)
+        answer = await openai_manager.create_completion(messages, max_output_tokens=400)
         
         if answer:
             # Add user mentions to the response if detected
@@ -1455,7 +1455,7 @@ async def web(interaction: discord.Interaction, query: str):
             {"role": "user", "content": f"Summarize these search results and answer the query: {sanitized_query}\n\n{snippets}"}
         ]
         
-        answer = await openai_manager.create_completion(messages, max_completion_tokens=1000)
+        answer = await openai_manager.create_completion(messages, max_output_tokens=400)
         
         if answer:
             await send_chunked_response(interaction, answer)
