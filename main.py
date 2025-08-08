@@ -459,39 +459,72 @@ class OpenAIManager:
     def __init__(self):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
 
-    async def create_completion(self, messages: list, max_tokens_visible: int = 400) -> Optional[str]:
+    async def create_completion(self, messages: list, **kwargs) -> Optional[str]:
+        """
+        Unified wrapper:
+        - GPT-5 → Responses API (max_output_tokens + reasoning.effort)
+        - others → Chat Completions (max_tokens)
+        Accepts BOTH max_output_tokens and max_completion_tokens from callers.
+        """
+        # Normalize token arg from callers
+        max_tokens_visible = kwargs.pop("max_output_tokens", None)
+        if max_tokens_visible is None:
+            max_tokens_visible = kwargs.pop("max_completion_tokens", 400)
         try:
-            model = "gpt-5-mini"
+            max_tokens_visible = int(max_tokens_visible)
+        except Exception:
+            max_tokens_visible = 400
 
-            def to_responses_input(msgs):
-                # simple join; or format however you like
-                lines = []
-                for m in msgs:
-                    role = m.get("role","user")
-                    content = m.get("content","")
-                    lines.append(f"{role.upper()}: {content}")
-                return "\n".join(lines)
+        model = "gpt-5-mini"  # flip here or via env if you want
 
+        try:
             if model.startswith("gpt-5"):
+                # Responses API path
                 resp = self.client.responses.create(
                     model=model,
-                    input=to_responses_input(messages),
+                    input=messages,  # list of {"role": "...", "content": "..."}
                     reasoning={"effort": "medium"},
                     max_output_tokens=max_tokens_visible,
                 )
                 text = getattr(resp, "output_text", "") or ""
+
+                if not text.strip():
+                    # one soft retry with lower reasoning effort
+                    resp = self.client.responses.create(
+                        model=model,
+                        input=messages,
+                        reasoning={"effort": "low"},
+                        max_output_tokens=max_tokens_visible,
+                    )
+                    text = getattr(resp, "output_text", "") or ""
+
             else:
+                # Chat Completions fallback (non‑5 models)
                 resp = self.client.chat.completions.create(
                     model=model,
                     messages=messages,
                     max_tokens=max_tokens_visible,
                 )
-                text = resp.choices[0].message.content or ""
+                choice = resp.choices[0]
+                try:
+                    logger.debug(f"finish_reason={choice.finish_reason}")
+                except Exception:
+                    pass
+                text = (choice.message.content or "").strip()
 
             if not text.strip():
+                logger.error("Model returned empty text after retries.")
                 return None
+
             return text
 
+        except openai.RateLimitError as e:
+            logger.warning(f"OpenAI rate limit exceeded: {e}")
+            return "I'm currently experiencing high demand. Please try again in a few moments."
+        except openai.APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            logger.error(f"API error details: {e.__dict__}")
+            return "I'm experiencing technical difficulties. Please try again later."
         except Exception as e:
             logger.error(f"Unexpected error in OpenAI completion: {e}")
             return "An unexpected error occurred. Please try again."
