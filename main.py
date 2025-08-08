@@ -463,7 +463,7 @@ class OpenAIManager:
         """Create OpenAI completion with error handling."""
         try:
             response = self.client.chat.completions.create(
-                model="openai/gpt-5-mini",
+                model="gpt-5-mini",
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.7
