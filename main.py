@@ -462,21 +462,31 @@ class OpenAIManager:
     async def create_completion(self, messages: list, max_completion_tokens: int = 300) -> Optional[str]:
         """Create OpenAI completion with error handling."""
         try:
+            logger.debug(f"Making OpenAI API call with model: gpt-5-mini, max_completion_tokens: {max_completion_tokens}")
+            logger.debug(f"Messages: {messages}")
+            
             response = self.client.chat.completions.create(
                 model="gpt-5-mini",
                 messages=messages,
                 max_completion_tokens=max_completion_tokens
-                
             )
-            return response.choices[0].message.content
-        except openai.RateLimitError:
-            logger.warning("OpenAI rate limit exceeded")
+            
+            logger.debug(f"OpenAI API response received successfully")
+            content = response.choices[0].message.content
+            logger.debug(f"Response content length: {len(content) if content else 0}")
+            return content
+            
+        except openai.RateLimitError as e:
+            logger.warning(f"OpenAI rate limit exceeded: {e}")
             return "I'm currently experiencing high demand. Please try again in a few moments."
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")
+            logger.error(f"API error details: {e.__dict__}")
             return "I'm experiencing technical difficulties. Please try again later."
         except Exception as e:
             logger.error(f"Unexpected error in OpenAI completion: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error details: {e.__dict__ if hasattr(e, '__dict__') else 'No details available'}")
             return "An unexpected error occurred. Please try again."
 
 openai_manager = OpenAIManager()
