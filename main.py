@@ -458,65 +458,82 @@ async def send_chunked_response(interaction: discord.Interaction, content: str, 
 class OpenAIManager:
     def __init__(self):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
+        # Allow overrides via env if you want to experiment without code changes
+        self.fast_model = os.getenv("FAST_MODEL", "gpt-4o-mini")
+        self.smart_model = os.getenv("SMART_MODEL", "gpt-5-mini")
 
     async def create_completion(self, messages: list, **kwargs) -> Optional[str]:
         """
-        Unified wrapper:
-        - GPT-5 → Responses API (max_output_tokens + reasoning.effort)
-        - others → Chat Completions (max_tokens)
-        Accepts BOTH max_output_tokens and max_completion_tokens from callers.
+        Router:
+          - Short/simple prompts -> gpt-4o-mini (Chat Completions)
+          - Otherwise -> gpt-5-mini (Responses API) with low effort + tight output cap
+        Back-compat:
+          accepts max_output_tokens and/or max_completion_tokens from callers.
         """
-        # Normalize token arg from callers
-        max_tokens_visible = kwargs.pop("max_output_tokens", None)
-        if max_tokens_visible is None:
-            max_tokens_visible = kwargs.pop("max_completion_tokens", 400)
+        # ----- normalize token args from callers -----
+        max_visible = kwargs.pop("max_output_tokens", None)
+        if max_visible is None:
+            max_visible = kwargs.pop("max_completion_tokens", 400)
         try:
-            max_tokens_visible = int(max_tokens_visible)
+            max_visible = int(max_visible)
         except Exception:
-            max_tokens_visible = 400
+            max_visible = 400
 
-        model = "gpt-5-mini"  # flip here or via env if you want
+        # ----- quick heuristic to decide model -----
+        user_text = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                user_text = m.get("content", "")
+                break
+
+        trigger_words = (
+            "explain", "why", "step by step", "reason", "analyze", "analyser", "plan",
+            "algorithm", "optimize", "proof", "derive", "math", "debug", "code review"
+        )
+        is_heavy = (len(user_text) > 180) or any(t in user_text.lower() for t in trigger_words)
 
         try:
-            if model.startswith("gpt-5"):
-                # Responses API path
-                resp = self.client.responses.create(
-                    model=model,
-                    input=messages,  # list of {"role": "...", "content": "..."}
-                    reasoning={"effort": "medium"},
-                    max_output_tokens=max_tokens_visible,
-                )
-                text = getattr(resp, "output_text", "") or ""
-
-                if not text.strip():
-                    # one soft retry with lower reasoning effort
-                    resp = self.client.responses.create(
-                        model=model,
-                        input=messages,
-                        reasoning={"effort": "low"},
-                        max_output_tokens=max_tokens_visible,
-                    )
-                    text = getattr(resp, "output_text", "") or ""
-
-            else:
-                # Chat Completions fallback (non‑5 models)
+            # ----- fast path: gpt-4o-mini via Chat Completions -----
+            if not is_heavy:
                 resp = self.client.chat.completions.create(
-                    model=model,
+                    model=self.fast_model,
                     messages=messages,
-                    max_tokens=max_tokens_visible,
+                    max_tokens=min(max_visible, 300),
                 )
-                choice = resp.choices[0]
-                try:
-                    logger.debug(f"finish_reason={choice.finish_reason}")
-                except Exception:
-                    pass
-                text = (choice.message.content or "").strip()
+                text = (resp.choices[0].message.content or "").strip()
+                if text:
+                    return text
+                # if somehow empty, fall through to smart path as a safety net
 
-            if not text.strip():
-                logger.error("Model returned empty text after retries.")
-                return None
+            # ----- smart path: gpt-5-mini via Responses API -----
+            resp = self.client.responses.create(
+                model=self.smart_model,
+                input=messages,  # list of {"role","content"}
+                reasoning={"effort": "low"},
+                max_output_tokens=min(max_visible, 200),
+            )
+            text = (getattr(resp, "output_text", "") or "").strip()
 
-            return text
+            if not text:
+                # soft retry: even smaller budget (keeps latency/cost down)
+                resp = self.client.responses.create(
+                    model=self.smart_model,
+                    input=messages,
+                    reasoning={"effort": "low"},
+                    max_output_tokens=120,
+                )
+                text = (getattr(resp, "output_text", "") or "").strip()
+
+            if text:
+                return text
+
+            # last resort: tiny fast fallback
+            resp = self.client.chat.completions.create(
+                model=self.fast_model,
+                messages=messages,
+                max_tokens=min(max_visible, 180),
+            )
+            return (resp.choices[0].message.content or "").strip() or None
 
         except openai.RateLimitError as e:
             logger.warning(f"OpenAI rate limit exceeded: {e}")
