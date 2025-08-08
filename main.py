@@ -458,50 +458,42 @@ async def send_chunked_response(interaction: discord.Interaction, content: str, 
 class OpenAIManager:
     def __init__(self):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
-    
-    async def create_completion(self, messages: list, max_output_tokens: int = 1000) -> Optional[str]:
-        """Create OpenAI completion with error handling."""
+
+    async def create_completion(self, messages: list, max_tokens_visible: int = 400) -> Optional[str]:
         try:
-            logger.debug(f"Making OpenAI API call with model: gpt-5-mini, max_output_tokens: {max_output_tokens}")
-            logger.debug(f"Messages count: {len(messages)}")
-            
-            response = self.client.chat.completions.create(
-                model="gpt-5-mini",
-                messages=messages,
-                max_output_tokens=max_output_tokens
-            )
-            
-            logger.debug(f"OpenAI API response received successfully")
-            logger.debug(f"Response object: {response}")
-            logger.debug(f"Response choices: {response.choices}")
-            
-            if not response.choices:
-                logger.error("No choices in OpenAI response")
+            model = "gpt-5-mini"
+
+            def to_responses_input(msgs):
+                # simple join; or format however you like
+                lines = []
+                for m in msgs:
+                    role = m.get("role","user")
+                    content = m.get("content","")
+                    lines.append(f"{role.upper()}: {content}")
+                return "\n".join(lines)
+
+            if model.startswith("gpt-5"):
+                resp = self.client.responses.create(
+                    model=model,
+                    input=to_responses_input(messages),
+                    reasoning={"effort": "medium"},
+                    max_output_tokens=max_tokens_visible,
+                )
+                text = getattr(resp, "output_text", "") or ""
+            else:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens_visible,
+                )
+                text = resp.choices[0].message.content or ""
+
+            if not text.strip():
                 return None
-                
-            content = response.choices[0].message.content
-            logger.debug(f"Response content: '{content}'")
-            logger.debug(f"Response content length: {len(content) if content else 0}")
-            logger.debug(f"Content is None: {content is None}")
-            logger.debug(f"Content is empty string: {content == ''}")
-            
-            if content is None or content == "":
-                logger.error("OpenAI returned empty or None content")
-                return None
-                
-            return content
-            
-        except openai.RateLimitError as e:
-            logger.warning(f"OpenAI rate limit exceeded: {e}")
-            return "I'm currently experiencing high demand. Please try again in a few moments."
-        except openai.APIError as e:
-            logger.error(f"OpenAI API error: {e}")
-            logger.error(f"API error details: {e.__dict__}")
-            return "I'm experiencing technical difficulties. Please try again later."
+            return text
+
         except Exception as e:
             logger.error(f"Unexpected error in OpenAI completion: {e}")
-            logger.error(f"Error type: {type(e).__name__}")
-            logger.error(f"Error details: {e.__dict__ if hasattr(e, '__dict__') else 'No details available'}")
             return "An unexpected error occurred. Please try again."
 
 openai_manager = OpenAIManager()
