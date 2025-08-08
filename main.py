@@ -26,7 +26,7 @@ except ImportError:
     POSTGRES_AVAILABLE = False
     psycopg2 = None
     RealDictCursor = None
-
+# Hi
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -459,14 +459,14 @@ class OpenAIManager:
     def __init__(self):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
     
-    async def create_completion(self, messages: list, max_tokens: int = 300) -> Optional[str]:
+    async def create_completion(self, messages: list, max_completion_tokens: int = 300) -> Optional[str]:
         """Create OpenAI completion with error handling."""
         try:
             response = self.client.chat.completions.create(
                 model="gpt-5-mini",
                 messages=messages,
-                max_completion_tokens=max_tokens,
-                temperature=0.7
+                max_completion_tokens=max_completion_tokens
+                
             )
             return response.choices[0].message.content
         except openai.RateLimitError:
@@ -1228,7 +1228,7 @@ async def on_message(message):
                     })
                     
                     # Create completion with context
-                    answer = await openai_manager.create_completion(messages_for_ai, max_tokens=400)
+                    answer = await openai_manager.create_completion(messages_for_ai, max_completion_tokens=400)
                     
                     if answer:
                         # Add user mentions to the response if detected
@@ -1351,7 +1351,7 @@ async def ask(interaction: discord.Interaction, prompt: str):
         })
         
         # Create completion with context
-        answer = await openai_manager.create_completion(messages, max_tokens=400)
+        answer = await openai_manager.create_completion(messages, max_completion_tokens=400)
         
         if answer:
             # Add user mentions to the response if detected
@@ -1430,7 +1430,7 @@ async def web(interaction: discord.Interaction, query: str):
             {"role": "user", "content": f"Summarize these search results and answer the query: {sanitized_query}\n\n{snippets}"}
         ]
         
-        answer = await openai_manager.create_completion(messages, max_tokens=400)
+        answer = await openai_manager.create_completion(messages, max_completion_tokens=400)
         
         if answer:
             await send_chunked_response(interaction, answer)
@@ -1467,7 +1467,7 @@ async def status(interaction: discord.Interaction):
         latency_ms = round(bot.latency * 1000)
         
         status_msg = f"""**GarGPT Status**
-Model: GPT-4o
+Model: GPT5-mini
 Active Personality: `{personality}`
 Uptime: `{uptime_str}`
 Latency: `{latency_ms} ms`
