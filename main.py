@@ -29,7 +29,7 @@ except ImportError:
 # Hi
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('gargpt.log'),
@@ -463,7 +463,7 @@ class OpenAIManager:
         """Create OpenAI completion with error handling."""
         try:
             logger.debug(f"Making OpenAI API call with model: gpt-5-mini, max_completion_tokens: {max_completion_tokens}")
-            logger.debug(f"Messages: {messages}")
+            logger.debug(f"Messages count: {len(messages)}")
             
             response = self.client.chat.completions.create(
                 model="gpt-5-mini",
@@ -472,8 +472,23 @@ class OpenAIManager:
             )
             
             logger.debug(f"OpenAI API response received successfully")
+            logger.debug(f"Response object: {response}")
+            logger.debug(f"Response choices: {response.choices}")
+            
+            if not response.choices:
+                logger.error("No choices in OpenAI response")
+                return None
+                
             content = response.choices[0].message.content
+            logger.debug(f"Response content: '{content}'")
             logger.debug(f"Response content length: {len(content) if content else 0}")
+            logger.debug(f"Content is None: {content is None}")
+            logger.debug(f"Content is empty string: {content == ''}")
+            
+            if content is None or content == "":
+                logger.error("OpenAI returned empty or None content")
+                return None
+                
             return content
             
         except openai.RateLimitError as e:
